@@ -14,6 +14,7 @@ import {
   parseCodexVersion,
   resolveCodexCommand,
   sandboxFor,
+  normalizeCodexActivity,
 } from "./local-agent-codex.js";
 import {
   AgentProviderInfrastructureError,
@@ -90,6 +91,75 @@ assert.deepEqual(capturedProbeOptions?.stdio, ["pipe", "pipe", "pipe"]);
 assert.equal(isCodexWindowsSandboxRunnerStartupFailure("timed out after 15000ms connecting runner pipe-in"), true);
 assert.equal(isCodexWindowsSandboxRunnerStartupFailure("timed out after 16000ms connecting runner pipe-out"), true);
 assert.equal(isCodexWindowsSandboxRunnerStartupFailure("timed out after 15000ms connecting runner pipe"), false);
+
+const safeCommandActivity = normalizeCodexActivity("item/completed", {
+  threadId: "thread_1",
+  turnId: "turn_1",
+  item: {
+    type: "commandExecution",
+    id: "item_1",
+    command: "secret command should not be exposed",
+    aggregatedOutput: "secret output should not be exposed",
+  },
+});
+assert.deepEqual(safeCommandActivity, {
+  category: "command",
+  kind: "command_execution",
+  status: "completed",
+  turnId: "turn_1",
+  itemId: "item_1",
+});
+
+const safeEditActivity = normalizeCodexActivity("item/completed", {
+  turnId: "turn_1",
+  item: {
+    type: "fileChange",
+    id: "item_2",
+    changes: [{ path: "src/secret.ts", diff: "secret diff" }],
+  },
+});
+assert.deepEqual(safeEditActivity, {
+  category: "edit",
+  kind: "file_change",
+  status: "completed",
+  turnId: "turn_1",
+  itemId: "item_2",
+  pathCount: 1,
+});
+
+const safeReasoningActivity = normalizeCodexActivity("item/reasoning/summaryTextDelta", {
+  turnId: "turn_1",
+  itemId: "item_reasoning",
+  delta: "hidden reasoning must not be exposed",
+});
+assert.deepEqual(safeReasoningActivity, {
+  category: "progress",
+  kind: "provider_progress",
+  status: "updated",
+  turnId: "turn_1",
+  itemId: "item_reasoning",
+});
+assert.doesNotMatch(JSON.stringify(safeReasoningActivity), /hidden reasoning/);
+assert.equal(normalizeCodexActivity("item/completed", {
+  turnId: "turn_1",
+  item: { type: "webSearch", id: "item_search" },
+})?.category, "search");
+assert.equal(normalizeCodexActivity("item/completed", {
+  turnId: "turn_1",
+  item: { type: "fileRead", id: "item_read" },
+})?.category, "read");
+assert.equal(normalizeCodexActivity("item/webSearch/started", {
+  turnId: "turn_1",
+  itemId: "item_search",
+})?.status, "started");
+assert.equal(normalizeCodexActivity("item/fileRead/completed", {
+  turnId: "turn_1",
+  itemId: "item_read",
+})?.category, "read");
+assert.equal(normalizeCodexActivity("item/completed", {
+  turnId: "turn_1",
+  item: { type: "futureProviderItem", id: "item_unknown" },
+}), undefined);
 
 async function rejectedProbe(
   child: ReturnType<typeof fakeProbeChild>,
@@ -273,13 +343,17 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   try {
     await runtime.initialize();
     let callbackSessionId: string | undefined;
+    const activities: unknown[] = [];
     const firstResult = await runtime.run({
       prompt: "first",
       workspaceRoot: "/tmp/project",
       writeMode: "read_only",
       model: "gpt-5.4",
       effort: "high",
-    }, { onSessionId: (id) => { callbackSessionId = id; } });
+    }, {
+      onSessionId: (id) => { callbackSessionId = id; },
+      onActivity: (activity) => { activities.push(activity); },
+    });
     assert.equal(firstResult.isOk(), true);
     if (firstResult.isErr()) throw firstResult.error;
     const first = firstResult.value;
@@ -293,6 +367,9 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     const resumed = resumedResult.value;
     assert.equal(first.providerSessionId, "thread_new");
     assert.equal(callbackSessionId, "thread_new");
+    assert.equal((activities[0] as { category?: string } | undefined)?.category, "assistant");
+    assert.equal((activities.at(-1) as { category?: string } | undefined)?.category, "status");
+    assert.doesNotMatch(JSON.stringify(activities), /fake response 1/);
     assert.equal(first.finalResponse, "fake response 1");
     assert.equal(resumed.providerSessionId, "thread_new");
     assert.equal(resumed.finalResponse, "fake response 2");

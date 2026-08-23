@@ -10,7 +10,7 @@ import {
 } from "./local-agent-daemon-protocol.js";
 import { LOCAL_AGENT_DAEMON_PROTOCOL_VERSION } from "./local-agent-daemon-lifecycle.js";
 
-assert.equal(LOCAL_AGENT_DAEMON_PROTOCOL_VERSION, 6);
+assert.equal(LOCAL_AGENT_DAEMON_PROTOCOL_VERSION, 7);
 
 const request = decodeLocalAgentDaemonRequest({
   requestId: "req_1",
@@ -77,6 +77,8 @@ const record = decodeAgentRecord({
   profileName: "reviewer",
   provider: "codex",
   status: "idle",
+  activitySequence: 0,
+  activity: [],
   latestResponse: "  response whitespace  \n",
   createdAt: "now",
   updatedAt: "now",
@@ -144,7 +146,7 @@ assert.deepEqual(waitRequest.params, {
   timeoutMs: 20_000,
 });
 
-for (const timeoutMs of [1, 1_000, 19_999, 20_000]) {
+for (const timeoutMs of [1, 1_000, 19_999, 20_000, 60_000]) {
   const customWaitRequest = decodeLocalAgentDaemonRequest({
     requestId: `req_wait_${timeoutMs}`,
     protocolVersion: LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
@@ -156,7 +158,17 @@ for (const timeoutMs of [1, 1_000, 19_999, 20_000]) {
   assert.equal(customWaitRequest.params.timeoutMs, timeoutMs);
 }
 
-for (const timeoutMs of [0, -1, 20_001, 1.5, "1000", null]) {
+const cursorRequest = decodeLocalAgentDaemonRequest({
+  requestId: "req_wait_cursor",
+  protocolVersion: LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
+  authToken: "test-secret",
+  method: "agent.wait",
+  params: { id: "agt_test", scope: cancelScope, afterSequence: 7 },
+});
+if (cursorRequest.method !== "agent.wait") throw new Error("expected agent.wait request");
+assert.equal(cursorRequest.params.afterSequence, 7);
+
+for (const timeoutMs of [0, -1, 60_001, 1.5, "1000", null]) {
   assert.throws(
     () => decodeLocalAgentDaemonRequest({
       requestId: "req_wait_invalid",
@@ -164,6 +176,19 @@ for (const timeoutMs of [0, -1, 20_001, 1.5, "1000", null]) {
       authToken: "test-secret",
       method: "agent.wait",
       params: { id: "agt_test", scope: cancelScope, timeoutMs },
+    }),
+    (error: unknown) => error instanceof LocalAgentDaemonProtocolError && error.code === "INVALID_PARAMS",
+  );
+}
+
+for (const afterSequence of [-1, 1.5, "7", null]) {
+  assert.throws(
+    () => decodeLocalAgentDaemonRequest({
+      requestId: "req_wait_invalid_cursor",
+      protocolVersion: LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
+      authToken: "test-secret",
+      method: "agent.wait",
+      params: { id: "agt_test", scope: cancelScope, afterSequence },
     }),
     (error: unknown) => error instanceof LocalAgentDaemonProtocolError && error.code === "INVALID_PARAMS",
   );
@@ -196,6 +221,8 @@ const failedRecord = decodeAgentRecord({
   profileName: "reviewer",
   provider: "codex",
   status: "error",
+  activitySequence: 0,
+  activity: [],
   error: "Timed out waiting for the local agent daemon.",
   errorCode: "DAEMON_TIMEOUT",
   errorRetryable: true,
@@ -205,9 +232,39 @@ const failedRecord = decodeAgentRecord({
 assert.equal(failedRecord.errorCode, "DAEMON_TIMEOUT");
 assert.equal(failedRecord.errorRetryable, true);
 
-const waitResult = decodeAgentWaitResult({ record, timedOut: true });
+const waitResult = decodeAgentWaitResult({
+  record,
+  timedOut: true,
+  wakeReason: "timeout",
+  activitySequence: 0,
+  activity: [],
+  activityTruncated: false,
+});
 assert.equal(waitResult.record.id, record.id);
 assert.equal(waitResult.timedOut, true);
+const activityEvent = {
+  sequence: 1,
+  category: "progress",
+  kind: "provider_progress",
+  status: "updated",
+  observedAt: "2026-08-23T00:00:00.000Z",
+};
+assert.throws(() => decodeAgentRecord({
+  ...record,
+  activitySequence: 0,
+  activity: [activityEvent],
+}));
+assert.throws(() => decodeAgentWaitResult({
+  record,
+  timedOut: false,
+  wakeReason: "activity",
+  activitySequence: 65,
+  activity: Array.from({ length: 65 }, (_, index) => ({
+    ...activityEvent,
+    sequence: index + 1,
+  })),
+  activityTruncated: false,
+}));
 for (const value of [
   {},
   { record, },

@@ -1,6 +1,7 @@
 import type { Result } from "better-result";
 import type { AgentProviderError } from "./local-agent-errors.js";
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
+import type { LocalAgentActivityInput } from "./local-agent-activity.js";
 
 export type LocalAgentWriteMode = "read_only" | "allowed" | "full_access";
 
@@ -29,6 +30,7 @@ export interface LocalAgentRunCallbacks {
    * could otherwise fail and lose that identity.
    */
   onSessionId?: (providerSessionId: string) => void | Promise<void>;
+  onActivity?: (activity: LocalAgentActivityInput) => void;
 }
 
 export interface LocalAgentRunControl {

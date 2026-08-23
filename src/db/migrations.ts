@@ -37,6 +37,11 @@ const migrations: Migration[] = [
     name: "local-agent-effort-rename",
     up: migrateLocalAgentEffortRename,
   },
+  {
+    version: 7,
+    name: "local-agent-activity",
+    up: migrateLocalAgentActivity,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -233,6 +238,12 @@ function migrateLocalAgentEffortRename(sqlite: Database.Database): void {
     return;
   }
   sqlite.exec("alter table local_agent_sessions rename column thinking to effort");
+}
+
+function migrateLocalAgentActivity(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "local_agent_sessions", "activity_sequence", "integer not null default 0");
+  addColumnIfMissing(sqlite, "local_agent_sessions", "last_activity_at", "text");
+  addColumnIfMissing(sqlite, "local_agent_sessions", "activity_json", "text not null default '[]'");
 }
 
 function addColumnIfMissing(

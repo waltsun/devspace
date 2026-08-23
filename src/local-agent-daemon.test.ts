@@ -33,6 +33,8 @@ const record: LocalAgentRecord = {
   profileName: "reviewer",
   provider: "codex",
   status: "running",
+  activitySequence: 0,
+  activity: [],
   createdAt: "now",
   updatedAt: "now",
 };
@@ -45,7 +47,7 @@ class FakeManager implements LocalAgentDaemonManager {
   lastCancel?: { agentId: string; scope: { workspaceId?: string; workspaceRoot: string } };
   cancelCalls = 0;
   cancelError = false;
-  waitCalls: Array<{ agentId: string; scope: LocalAgentWorkspaceScope; timeoutMs: number }> = [];
+  waitCalls: Array<{ agentId: string; scope: LocalAgentWorkspaceScope; timeoutMs: number; afterSequence?: number }> = [];
   waitRecordStatus: LocalAgentRecord["status"] = "idle";
   waitTimedOut = false;
   waitError?: AgentWaitError;
@@ -89,13 +91,18 @@ class FakeManager implements LocalAgentDaemonManager {
     agentId: string,
     scope: LocalAgentWorkspaceScope,
     timeoutMs: number,
+    afterSequence?: number,
   ): Promise<import("better-result").Result<AgentWaitResult, AgentWaitError>> {
-    this.waitCalls.push({ agentId, scope, timeoutMs });
+    this.waitCalls.push({ agentId, scope, timeoutMs, afterSequence });
     if (this.waitGate) return this.waitGate;
     if (this.waitError) return Promise.resolve(Result.err(this.waitError));
     return Promise.resolve(Result.ok({
       record: { ...record, status: this.waitRecordStatus },
       timedOut: this.waitTimedOut,
+      wakeReason: this.waitTimedOut ? "timeout" : "terminal",
+      activitySequence: record.activitySequence,
+      activity: [],
+      activityTruncated: false,
     }));
   }
 
@@ -178,7 +185,11 @@ try {
     agentId: record.id,
     scope: recordScope,
     timeoutMs: 5_000,
+    afterSequence: undefined,
   });
+  const cursorWait = unwrap(await client.wait(record.id, recordScope, 5_000, 7));
+  assert.equal(cursorWait.wakeReason, "terminal");
+  assert.equal(manager.waitCalls.at(-1)?.afterSequence, 7);
   manager.waitRecordStatus = "running";
   manager.waitTimedOut = true;
   const timedOutWait = unwrap(await client.wait(record.id, recordScope));
@@ -191,6 +202,10 @@ try {
     manager.resolveWait = () => resolve(Result.ok({
       record: { ...record, status: "idle", latestResponse: "completed by wait" },
       timedOut: false,
+      wakeReason: "terminal",
+      activitySequence: record.activitySequence,
+      activity: [],
+      activityTruncated: false,
     }));
   });
   manager.waitGate = longPoll;
@@ -203,6 +218,27 @@ try {
   assert.equal(longPollResult.record.latestResponse, "completed by wait");
   manager.waitGate = undefined;
   manager.resolveWait = undefined;
+
+  const shortTransportClient = new LocalAgentClient({
+    stateDir: join(root, "state"),
+    platform: "linux",
+    requestTimeoutMs: 20,
+    spawnDaemon: () => { throw new Error("existing daemon should be used"); },
+  });
+  manager.waitGate = new Promise((resolve) => {
+    setTimeout(() => resolve(Result.ok({
+      record: { ...record, status: "idle", latestResponse: "completed after transport timeout" },
+      timedOut: false,
+      wakeReason: "terminal",
+      activitySequence: record.activitySequence,
+      activity: [],
+      activityTruncated: false,
+    })), 40);
+  });
+  const extendedTransportWait = unwrap(await shortTransportClient.wait(record.id, recordScope, 50));
+  assert.equal(extendedTransportWait.record.latestResponse, "completed after transport timeout");
+  manager.waitGate = undefined;
+
   manager.waitError = new AgentTargetError({
     code: "AGENT_NOT_FOUND",
     target: record.id,

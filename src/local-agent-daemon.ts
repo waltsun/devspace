@@ -58,7 +58,7 @@ export interface LocalAgentDaemonManager {
   continue(agentId: string, prompt: string, overrides: RunOverrides | undefined, scope: LocalAgentWorkspaceScope): Promise<Result<LocalAgentRecord, AgentContinueError>>;
   cancel(agentId: string, scope: LocalAgentWorkspaceScope): Result<LocalAgentRecord, AgentCancelError>;
   get(agentId: string, scope: LocalAgentWorkspaceScope): Result<LocalAgentRecord, AgentLookupError>;
-  wait(agentId: string, scope: LocalAgentWorkspaceScope, timeoutMs: number): Promise<Result<AgentWaitResult, AgentWaitError>>;
+  wait(agentId: string, scope: LocalAgentWorkspaceScope, timeoutMs: number, afterSequence?: number): Promise<Result<AgentWaitResult, AgentWaitError>>;
   list(scope: LocalAgentWorkspaceScope): Result<LocalAgentRecord[], AgentListError>;
   evictIdle(now?: number): Promise<void>;
   close(): Promise<void>;
@@ -325,6 +325,7 @@ export class LocalAgentDaemon {
           request.params.id,
           request.params.scope,
           request.params.timeoutMs,
+          request.params.afterSequence,
         ));
       case "agent.list":
         return unwrapManagerResult(this.manager.list(request.params));

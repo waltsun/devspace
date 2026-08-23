@@ -58,6 +58,7 @@ import type { LocalAgentRecord, LocalAgentWorkspaceScope } from "./local-agent-s
 
 const DEFAULT_STARTUP_TIMEOUT_MS = 8_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const AGENT_WAIT_TRANSPORT_GRACE_MS = 1_000;
 const RETRY_DELAY_MS = 40;
 
 type RequestError<M extends LocalAgentDaemonRequest["method"]> =
@@ -146,8 +147,14 @@ export class LocalAgentClient {
     agentId: string,
     scope: LocalAgentWorkspaceScope,
     timeoutMs: number = DEFAULT_AGENT_WAIT_TIMEOUT_MS,
+    afterSequence?: number,
   ): Promise<BetterResult<AgentWaitResult, AgentWaitError | AgentDaemonError>> {
-    const result = await this.request("agent.wait", { id: agentId, scope, timeoutMs });
+    const result = await this.request("agent.wait", {
+      id: agentId,
+      scope,
+      timeoutMs,
+      ...(afterSequence === undefined ? {} : { afterSequence }),
+    }, Math.max(this.requestTimeoutMs, timeoutMs + AGENT_WAIT_TRANSPORT_GRACE_MS));
     return decodeRequestResult(result, "agent.wait", decodeAgentWaitResult);
   }
 
@@ -359,6 +366,7 @@ export class LocalAgentClient {
   private async request<M extends LocalAgentDaemonRequest["method"]>(
     method: M,
     params: Extract<LocalAgentDaemonRequest, { method: M }>['params'],
+    timeoutMs: number = this.requestTimeoutMs,
   ): Promise<BetterResult<unknown, RequestError<M>>> {
     const ready = await this.ensureReady();
     if (ready.isErr()) return ready as BetterResult<unknown, RequestError<M>>;
@@ -370,7 +378,7 @@ export class LocalAgentClient {
       authToken: authToken.value,
       method,
       params,
-    } as LocalAgentDaemonRequest, this.requestTimeoutMs);
+    } as LocalAgentDaemonRequest, timeoutMs);
     if (response.isErr()) return response as BetterResult<unknown, RequestError<M>>;
     if (!response.value.ok) {
       const error = decodeRemoteError(response.value.error, method);

@@ -60,6 +60,7 @@ import {
   createLocalAgentClient,
   type LocalAgentClient,
 } from "./local-agent-client.js";
+import type { LocalAgentActivityEvent } from "./local-agent-activity.js";
 import type { LocalAgentRecord } from "./local-agent-store.js";
 import {
   getLocalAgentProviderAvailabilitySnapshot,
@@ -238,7 +239,7 @@ function serverInstructions(config: ServerConfig): string {
       ? " If the turn successfully modifies files by creating, editing, overwriting, deleting, moving, or applying patches, call show_changes exactly once for that workspace after the final related file change and before your final response so the user can inspect the aggregate diff for that turn. Do not call it after every individual file change; do not skip it because individual file-change tools already returned diffs."
       : "";
   const subagentInstruction = config.subagents.enabled
-    ? " When a suitable local coding agent is available and delegation is useful, use agent_start with the current workspaceId. agent_start returns immediately. Use agent_wait to wait for the current turn. Use agent_continue to start another turn on an existing agent after its previous turn is no longer active. Use agent_cancel when an active turn should be interrupted; cancellation is asynchronous, so use agent_wait afterward to observe the result. A wait timeout does not stop the agent. Use agent_get for an immediate snapshot of one existing agent without waiting. Use agent_list to rediscover durable agents in the current workspace, especially after reconnecting or resuming work."
+    ? " When a suitable local coding agent is available and delegation is useful, use agent_start with the current workspaceId. agent_start returns immediately. Use agent_wait to wait for the current turn; a wait timeout never cancels the turn, so repeat agent_wait while the agent is still useful. When afterSequence is available, pass the latest activitySequence to wait for new observable progress. Use agent_get for the detailed current activity ring before cancelling a running agent, especially when no files have changed yet. Use agent_continue to start another turn on an existing agent after its previous turn is no longer active. Use agent_cancel only when an active turn should be interrupted; cancellation is asynchronous, so use agent_wait afterward to observe the result. Use agent_list to rediscover durable agents in the current workspace, especially after reconnecting or resuming work."
     : "";
 
   if (config.toolMode === "codex") {
@@ -312,7 +313,25 @@ function agentOutputSchema(): z.ZodRawShape {
     error: z.string().optional(),
     errorCode: z.string().optional(),
     errorRetryable: z.boolean().optional(),
+    activitySequence: z.number().int().nonnegative(),
+    lastActivityAt: z.string().optional(),
+    lastActivity: agentActivityEventSchema().optional(),
   };
+}
+
+function agentActivityEventSchema() {
+  return z.object({
+    sequence: z.number().int().positive(),
+    category: z.enum(["read", "search", "edit", "command", "assistant", "progress", "session", "status"]),
+    kind: z.string(),
+    status: z.enum(["started", "updated", "completed", "failed", "cancelled"]).optional(),
+    observedAt: z.string(),
+    providerAt: z.string().optional(),
+    turnId: z.string().optional(),
+    itemId: z.string().optional(),
+    summary: z.string().optional(),
+    pathCount: z.number().int().nonnegative().optional(),
+  });
 }
 
 function agentStartOutputSchema(): z.ZodRawShape {
@@ -331,6 +350,10 @@ function agentWaitOutputSchema(): z.ZodRawShape {
   return resultOutputSchema({
     agent: z.object(agentOutputSchema()),
     timedOut: z.boolean(),
+    wakeReason: z.enum(["activity", "terminal", "timeout"]),
+    activitySequence: z.number().int().nonnegative(),
+    activity: z.array(agentActivityEventSchema()),
+    activityTruncated: z.boolean(),
   });
 }
 
@@ -343,7 +366,10 @@ function agentCancelOutputSchema(): z.ZodRawShape {
 
 function agentGetOutputSchema(): z.ZodRawShape {
   return resultOutputSchema({
-    agent: z.object(agentOutputSchema()),
+    agent: z.object({
+      ...agentOutputSchema(),
+      activity: z.array(agentActivityEventSchema()),
+    }),
   });
 }
 
@@ -367,7 +393,22 @@ function agentOutput(record: LocalAgentRecord) {
     error: record.error,
     errorCode: record.errorCode,
     errorRetryable: record.errorRetryable,
+    activitySequence: record.activitySequence,
+    lastActivityAt: record.lastActivityAt,
+    lastActivity: record.activity.at(-1),
   };
+}
+
+function agentDetailOutput(record: LocalAgentRecord) {
+  return {
+    ...agentOutput(record),
+    activity: record.activity,
+  };
+}
+
+function formatAgentActivity(event: LocalAgentActivityEvent | undefined): string | undefined {
+  if (!event) return undefined;
+  return `${event.category} (${event.kind}${event.status ? `, ${event.status}` : ""})`;
 }
 
 function agentErrorResponse(error: LocalAgentError) {
@@ -905,7 +946,7 @@ function registerLocalAgentTools(
     {
       title: "Wait for agent",
       description:
-        "Wait for an existing local coding-agent turn to finish, for at most 20 seconds. A timeout does not cancel or stop the agent. Call it again to continue waiting.",
+        "Wait for an existing local coding-agent turn to finish or report new observable activity, for at most 60 seconds. A timeout never cancels or stops the agent. Repeat this call while the agent is useful; pass afterSequence from the previous result to wait for newer activity.",
       inputSchema: {
         workspaceId: z.string().describe(workspaceIdDescription),
         agentId: z.string().min(1).describe("Durable agent identifier returned by agent_start."),
@@ -913,24 +954,30 @@ function registerLocalAgentTools(
           .number()
           .int()
           .min(1)
-          .max(20_000)
+          .max(60_000)
           .optional()
-          .describe("Milliseconds to wait, from 1 through 20000. Defaults to 20000."),
+          .describe("Milliseconds to wait, from 1 through 60000. Defaults to 20000; timeout never cancels the agent."),
+        afterSequence: z
+          .number()
+          .int()
+          .nonnegative()
+          .optional()
+          .describe("Optional activitySequence cursor. With it, return when newer observable activity arrives or the turn settles."),
       },
       outputSchema: agentWaitOutputSchema(),
       _meta: {},
       annotations: AGENT_WAIT_ANNOTATIONS,
     },
-    async ({ workspaceId, agentId, timeoutMs }) => {
+    async ({ workspaceId, agentId, timeoutMs, afterSequence }) => {
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
       const scope = {
         workspaceId: workspace.id,
         workspaceRoot: workspace.root,
       };
-      const response = timeoutMs === undefined
+      const response = timeoutMs === undefined && afterSequence === undefined
         ? await client.wait(agentId, scope)
-        : await client.wait(agentId, scope, timeoutMs);
+        : await client.wait(agentId, scope, timeoutMs, afterSequence);
 
       if (response.isErr()) {
         const errorResponse = agentErrorResponse(response.error);
@@ -942,9 +989,13 @@ function registerLocalAgentTools(
       }
 
       const agent = agentOutput(response.value.record);
-      const result = response.value.timedOut
-        ? `Agent ${agent.id} is still running after the wait timeout.`
-        : `Agent ${agent.id} finished its current turn with status ${agent.status}.`;
+      const latestActivity = response.value.activity.at(-1) ?? agent.lastActivity;
+      const activityText = formatAgentActivity(latestActivity);
+      const result = response.value.wakeReason === "activity"
+        ? `Agent ${agent.id} is still running; latest activity: ${activityText ?? "observable progress"}.`
+        : response.value.timedOut
+          ? `Agent ${agent.id} is still running after the wait timeout${activityText ? `; latest activity: ${activityText}` : ""}. A wait timeout does not stop the agent.`
+          : `Agent ${agent.id} finished its current turn with status ${agent.status}.`;
       const content = [textBlock(result)];
       logToolCall(config, {
         tool: "agent_wait",
@@ -958,6 +1009,10 @@ function registerLocalAgentTools(
           result,
           agent,
           timedOut: response.value.timedOut,
+          wakeReason: response.value.wakeReason,
+          activitySequence: response.value.activitySequence,
+          activity: response.value.activity,
+          activityTruncated: response.value.activityTruncated,
         },
       };
     },
@@ -1083,7 +1138,7 @@ function registerLocalAgentTools(
     {
       title: "Get agent",
       description:
-        "Get the current state of one durable local coding agent in the current DevSpace workspace. This is an immediate snapshot and does not wait for a running turn to finish. Use agent_wait when waiting for the current turn is desired.",
+        "Get the current state and bounded recent observable activity of one durable local coding agent in the current DevSpace workspace. This is an immediate snapshot and does not wait for a running turn to finish. Inspect activity and lastActivityAt before cancelling a running agent; use agent_wait when waiting is desired.",
       inputSchema: {
         workspaceId: z.string().describe(workspaceIdDescription),
         agentId: z.string().min(1).describe("Durable agent identifier returned by agent_start."),
@@ -1110,7 +1165,7 @@ function registerLocalAgentTools(
         return errorResponse;
       }
 
-      const agent = agentOutput(response.value);
+      const agent = agentDetailOutput(response.value);
       const errorCode = agent.status === "error" && agent.errorCode
         ? ` (${agent.errorCode})`
         : "";

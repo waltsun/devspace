@@ -22,6 +22,7 @@ import type {
 import { LocalAgentRuntimePool } from "./local-agent-runtime-pool.js";
 import { LocalAgentStore } from "./local-agent-store.js";
 import type { SubagentsConfig } from "./local-agent-config.js";
+import type { LocalAgentActivityInput } from "./local-agent-activity.js";
 
 const root = await mkdtemp(join(tmpdir(), "devspace-agent-manager-test-"));
 const directRoot = await mkdtemp(join(tmpdir(), "devspace-direct-agent-manager-test-"));
@@ -56,6 +57,7 @@ class FakeRuntime implements LocalAgentRuntime {
   abortEvents = 0;
   immediateWorkStarted = false;
   closed = false;
+  private activityCallback?: (activity: LocalAgentActivityInput) => void;
   private releaseHold: (() => void) | undefined;
 
   async run(
@@ -65,6 +67,7 @@ class FakeRuntime implements LocalAgentRuntime {
   ): Promise<BetterResult<LocalAgentRunResult, AgentProviderError>> {
     this.inputs.push(input);
     this.controls.push(control);
+    this.activityCallback = callbacks?.onActivity;
     if (input.prompt.includes("early-fail")) {
       await callbacks?.onSessionId?.("thread_early");
       return Result.err(providerFailure("provider failed after session creation"));
@@ -109,7 +112,9 @@ class FakeRuntime implements LocalAgentRuntime {
     }
     if (input.prompt.includes("defect")) throw new TypeError("internal defect");
     if (input.prompt.includes("fail")) return Result.err(providerFailure("provider failed"));
-    if (input.prompt.includes("hold")) {
+    if (input.prompt.includes("activity-hold")) {
+      await new Promise<void>((resolve) => { this.releaseHold = resolve; });
+    } else if (input.prompt.includes("hold")) {
       await new Promise<void>((resolve) => { this.releaseHold = resolve; });
     }
     return Result.ok({
@@ -123,6 +128,10 @@ class FakeRuntime implements LocalAgentRuntime {
   release(): void {
     this.releaseHold?.();
     this.releaseHold = undefined;
+  }
+
+  emitActivity(activity: LocalAgentActivityInput): void {
+    this.activityCallback?.(activity);
   }
 
   releaseSession(): Promise<void> {
@@ -344,6 +353,7 @@ for (const result of [waitSuccessResultOne, waitSuccessResultTwo]) {
     assert.equal(result.value.record.status, "idle");
     assert.match(result.value.record.latestResponse ?? "", /wait-success-hold/);
   }
+
 }
 
 const waitTimeout = unwrap(await manager.start({
@@ -364,6 +374,67 @@ if (waitTimeoutResult.isOk()) {
 assert.equal(runtimes.get(waitTimeout.id)!.controls[0]?.signal?.aborted, false);
 runtimes.get(waitTimeout.id)!.release();
 await waitFor(() => getRecord(waitTimeout.id).status === "idle");
+
+const activityAgent = unwrap(await manager.start({
+  target: "reviewer",
+  prompt: "activity-hold",
+  workspaceId: scope.workspaceId,
+  workspaceRoot: root,
+}));
+await waitFor(() => runtimes.get(activityAgent.id)?.inputs.length === 1);
+const activityRuntime = runtimes.get(activityAgent.id)!;
+const activityCursor = getRecord(activityAgent.id).activitySequence;
+const activityWait = manager.wait(activityAgent.id, scope, 1_000, activityCursor);
+activityRuntime.emitActivity({
+  category: "command",
+  kind: "command_execution",
+  status: "started",
+});
+const activityWaitResult = await activityWait;
+assert.equal(activityWaitResult.isOk(), true);
+if (activityWaitResult.isOk()) {
+  assert.equal(activityWaitResult.value.wakeReason, "activity");
+  assert.equal(activityWaitResult.value.timedOut, false);
+  assert.equal(activityWaitResult.value.record.status, "running");
+  assert.equal(activityWaitResult.value.activity[0]?.category, "command");
+  assert.ok(activityWaitResult.value.activitySequence > activityCursor);
+}
+assert.equal(activityRuntime.controls[0]?.signal?.aborted, false);
+const afterActivity = getRecord(activityAgent.id).activitySequence;
+const activityTimeoutKeepAlive = setInterval(() => undefined, 1);
+const activityTimeout = await manager.wait(activityAgent.id, scope, 10, afterActivity);
+clearInterval(activityTimeoutKeepAlive);
+assert.equal(activityTimeout.isOk(), true);
+if (activityTimeout.isOk()) {
+  assert.equal(activityTimeout.value.wakeReason, "timeout");
+  assert.equal(activityTimeout.value.timedOut, true);
+  assert.equal(activityTimeout.value.record.status, "running");
+}
+assert.equal(activityRuntime.controls[0]?.signal?.aborted, false);
+for (let index = 0; index < 70; index += 1) {
+  activityRuntime.emitActivity({
+    category: "progress",
+    kind: "provider_progress",
+    status: "updated",
+  });
+}
+const truncatedActivity = await manager.wait(activityAgent.id, scope, 1_000, 0);
+assert.equal(truncatedActivity.isOk(), true);
+if (truncatedActivity.isOk()) {
+  assert.equal(truncatedActivity.value.activityTruncated, true);
+  assert.equal(truncatedActivity.value.activity.length, 64);
+  assert.ok((truncatedActivity.value.activity[0]?.sequence ?? 0) > 1);
+}
+const terminalCursor = getRecord(activityAgent.id).activitySequence;
+const terminalWait = manager.wait(activityAgent.id, scope, 1_000, terminalCursor);
+activityRuntime.release();
+const terminalWaitResult = await terminalWait;
+assert.equal(terminalWaitResult.isOk(), true);
+if (terminalWaitResult.isOk()) {
+  assert.equal(terminalWaitResult.value.wakeReason, "terminal");
+  assert.equal(terminalWaitResult.value.record.status, "idle");
+}
+await waitFor(() => getRecord(activityAgent.id).status === "idle");
 
 const failed = unwrap(await manager.start({
   target: "reviewer",

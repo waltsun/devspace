@@ -3,6 +3,10 @@ import type {
   LocalAgentStatus,
   LocalAgentWorkspaceScope,
 } from "./local-agent-store.js";
+import {
+  readActivityEvents,
+  type LocalAgentActivityEvent,
+} from "./local-agent-activity.js";
 import type {
   AgentWaitResult,
   RunOverrides,
@@ -33,7 +37,7 @@ export type LocalAgentDaemonRequest =
   | AgentDaemonRequestBase<"agent.continue", { id: string; prompt: string; scope: LocalAgentWorkspaceScope; overrides?: RunOverrides }>
   | AgentDaemonRequestBase<"agent.get", { id: string; scope: LocalAgentWorkspaceScope }>
   | AgentDaemonRequestBase<"agent.cancel", { id: string; scope: LocalAgentWorkspaceScope }>
-  | AgentDaemonRequestBase<"agent.wait", { id: string; scope: LocalAgentWorkspaceScope; timeoutMs: number }>
+  | AgentDaemonRequestBase<"agent.wait", { id: string; scope: LocalAgentWorkspaceScope; timeoutMs: number; afterSequence?: number }>
   | AgentDaemonRequestBase<"agent.list", LocalAgentWorkspaceScope>
   | AgentDaemonRequestBase<"daemon.status", Record<string, never>>
   | AgentDaemonRequestBase<"daemon.stop", Record<string, never>>
@@ -149,6 +153,9 @@ export function decodeLocalAgentDaemonRequest(value: unknown): LocalAgentDaemonR
         params: {
           ...decodeAgentScopedIdParams(params),
           timeoutMs: decodeWaitTimeoutMs(record?.timeoutMs),
+          ...(record?.afterSequence === undefined
+            ? {}
+            : { afterSequence: decodeActivityCursor(record.afterSequence) }),
         },
       } as LocalAgentDaemonRequest;
     }
@@ -205,6 +212,11 @@ export function decodeAgentRecord(value: unknown): LocalAgentRecord {
   const record = asRecord(value);
   const status = requiredString(record?.status, "status");
   if (!isLocalAgentStatus(status)) throw new LocalAgentDaemonProtocolError("INVALID_RECORD", "Invalid agent status.");
+  const activitySequence = requiredNonNegativeInteger(record?.activitySequence, "activitySequence");
+  const activity = decodeActivityList(record?.activity);
+  if (activity.at(-1)?.sequence && activity.at(-1)!.sequence > activitySequence) {
+    throw new LocalAgentDaemonProtocolError("INVALID_RECORD", "Activity sequence is behind the retained activity ring.");
+  }
   return {
     id: requiredString(record?.id, "id"),
     workspaceId: optionalString(record?.workspaceId),
@@ -219,6 +231,9 @@ export function decodeAgentRecord(value: unknown): LocalAgentRecord {
     error: optionalContentString(record?.error),
     errorCode: optionalString(record?.errorCode),
     errorRetryable: optionalBoolean(record?.errorRetryable),
+    activitySequence,
+    lastActivityAt: optionalString(record?.lastActivityAt),
+    activity,
     createdAt: requiredString(record?.createdAt, "createdAt"),
     updatedAt: requiredString(record?.updatedAt, "updatedAt"),
   };
@@ -338,9 +353,17 @@ function decodeListScope(value: unknown): LocalAgentWorkspaceScope {
 
 export function decodeAgentWaitResult(value: unknown): AgentWaitResult {
   const record = asRecord(value);
+  const wakeReason = requiredString(record?.wakeReason, "wakeReason");
+  if (wakeReason !== "activity" && wakeReason !== "terminal" && wakeReason !== "timeout") {
+    throw new LocalAgentDaemonProtocolError("INVALID_RESULT", "Daemon returned an invalid agent wait wake reason.");
+  }
   return {
     record: decodeAgentRecord(record?.record),
     timedOut: requiredBoolean(record?.timedOut, "timedOut"),
+    wakeReason,
+    activitySequence: requiredNonNegativeInteger(record?.activitySequence, "activitySequence"),
+    activity: decodeActivityList(record?.activity),
+    activityTruncated: requiredBoolean(record?.activityTruncated, "activityTruncated"),
   };
 }
 
@@ -365,6 +388,31 @@ function decodeWaitTimeoutMs(value: unknown): number {
     );
   }
   return value;
+}
+
+function decodeActivityCursor(value: unknown): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new LocalAgentDaemonProtocolError(
+      "INVALID_PARAMS",
+      "Agent wait afterSequence must be a non-negative safe integer.",
+    );
+  }
+  return value;
+}
+
+function requiredNonNegativeInteger(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new LocalAgentDaemonProtocolError("INVALID_PROTOCOL", `Invalid ${field}.`);
+  }
+  return value;
+}
+
+function decodeActivityList(value: unknown): LocalAgentActivityEvent[] {
+  try {
+    return readActivityEvents(value, "activity");
+  } catch (cause) {
+    throw new LocalAgentDaemonProtocolError("INVALID_RESULT", "Daemon returned invalid agent activity.", { cause });
+  }
 }
 
 function decodeLogsParams(value: unknown): { lines?: number } {

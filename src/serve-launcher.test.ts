@@ -30,7 +30,7 @@ function fakeChildProcess(child: FakeChild): ChildProcess {
 function hostStatus(sessionId = 2): LocalAgentDaemonStatus {
   return {
     state: "ready",
-    protocolVersion: 6,
+    protocolVersion: 7,
     pid: 4321,
     endpoint: "test-agent-host",
     host: {

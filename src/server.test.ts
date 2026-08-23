@@ -10,8 +10,10 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Result } from "better-result";
 import { loadConfig, type ServerConfig } from "./config.js";
 import type { LocalAgentProviderAvailability } from "./local-agent-availability.js";
+import type { LocalAgentActivityEvent } from "./local-agent-activity.js";
 import { buildLocalAgentProviderStatuses } from "./local-agent-catalog.js";
 import type { SubagentsConfig } from "./local-agent-config.js";
+import type { AgentWaitResult } from "./local-agent-manager.js";
 import {
   AgentConflictError,
   AgentDaemonUnavailableError,
@@ -168,7 +170,7 @@ test("agent_start resolves the workspace and returns without waiting", async (t)
     },
     wait: async () => {
       waitCalled = true;
-      return Result.ok({ record, timedOut: false });
+      return Result.ok(makeAgentWaitResult(record));
     },
   });
   const context = await fixture(t, {
@@ -213,6 +215,7 @@ test("agent_wait forwards the resolved workspace scope and returns a completed t
     agentId: string;
     scope: { workspaceId?: string; workspaceRoot: string };
     timeoutMs?: number;
+    afterSequence?: number;
   } | undefined;
   const record = makeAgentRecord({
     id: "agt_wait_done",
@@ -221,9 +224,9 @@ test("agent_wait forwards the resolved workspace scope and returns a completed t
   });
   const localAgentClient = makeLocalAgentMcpClient({
     start: async () => Result.ok(record),
-    wait: async (agentId, scope, timeoutMs) => {
-      waitInput = { agentId, scope, timeoutMs };
-      return Result.ok({ record, timedOut: false });
+    wait: async (agentId, scope, timeoutMs, afterSequence) => {
+      waitInput = { agentId, scope, timeoutMs, afterSequence };
+      return Result.ok(makeAgentWaitResult(record));
     },
   });
   const context = await fixture(t, {
@@ -235,6 +238,7 @@ test("agent_wait forwards the resolved workspace scope and returns a completed t
   const response = await callAgentWait(context.client, {
     workspaceId: opened.workspaceId,
     agentId: record.id,
+    afterSequence: 3,
   });
 
   assert.deepEqual(waitInput, {
@@ -244,6 +248,7 @@ test("agent_wait forwards the resolved workspace scope and returns a completed t
       workspaceRoot: opened.root,
     },
     timeoutMs: undefined,
+    afterSequence: 3,
   });
   const structured = structuredContent(response);
   assert.equal(structured.timedOut, false);
@@ -259,7 +264,7 @@ test("agent_wait reports a bounded timeout without stopping the agent", async (t
     start: async () => Result.ok(record),
     wait: async (_agentId, _scope, timeoutMs) => {
       assert.equal(timeoutMs, 1_000);
-      return Result.ok({ record, timedOut: true });
+      return Result.ok(makeAgentWaitResult(record, true));
     },
   });
   const context = await fixture(t, {
@@ -278,7 +283,70 @@ test("agent_wait reports a bounded timeout without stopping the agent", async (t
   assert.equal(structured.timedOut, true);
   assert.equal((structured.agent as Record<string, unknown>).status, "running");
   assert.match(responseText(response), /still running after the wait timeout/);
-  assert.doesNotMatch(responseText(response), /stop/i);
+  assert.match(responseText(response), /does not stop/i);
+});
+
+test("agent activity is detailed for get, incremental for wait, and compact for list", async (t) => {
+  const event: LocalAgentActivityEvent = {
+    sequence: 2,
+    category: "command",
+    kind: "command_execution",
+    status: "started",
+    observedAt: "2026-08-23T00:00:00.000Z",
+  };
+  const record = makeAgentRecord({
+    id: "agt_activity_surface",
+    activitySequence: 2,
+    lastActivityAt: event.observedAt,
+    activity: [event],
+  });
+  const localAgentClient = makeLocalAgentMcpClient({
+    get: async () => Result.ok(record),
+    list: async () => Result.ok([record]),
+    wait: async (_agentId, _scope, _timeoutMs, afterSequence) => {
+      assert.equal(afterSequence, 1);
+      return Result.ok({
+        record,
+        timedOut: false,
+        wakeReason: "activity",
+        activitySequence: 2,
+        activity: [event],
+        activityTruncated: false,
+      });
+    },
+  });
+  const context = await fixture(t, {
+    localAgentProviders: [{ name: "codex", available: true }],
+    localAgentClient,
+  });
+  const opened = structuredContent(await callOpen(context.client, context.project));
+
+  const getResponse = await callAgentGet(context.client, {
+    workspaceId: opened.workspaceId,
+    agentId: record.id,
+  });
+  const getAgent = structuredContent(getResponse).agent as Record<string, unknown>;
+  assert.deepEqual(getAgent.activity, [event]);
+  assert.equal(getAgent.activitySequence, 2);
+  assert.equal(getAgent.lastActivityAt, event.observedAt);
+
+  const waitResponse = await callAgentWait(context.client, {
+    workspaceId: opened.workspaceId,
+    agentId: record.id,
+    afterSequence: 1,
+  });
+  const waitStructured = structuredContent(waitResponse);
+  assert.equal(waitStructured.wakeReason, "activity");
+  assert.deepEqual(waitStructured.activity, [event]);
+  assert.match(responseText(waitResponse), /latest activity: command/);
+
+  const listResponse = await callAgentList(context.client, {
+    workspaceId: opened.workspaceId,
+  });
+  const listAgent = (structuredContent(listResponse).agents as Array<Record<string, unknown>>)[0]!;
+  assert.equal(listAgent.activitySequence, 2);
+  assert.deepEqual(listAgent.lastActivity, event);
+  assert.equal("activity" in listAgent, false);
 });
 
 test("agent_continue forwards the workspace scope and overrides without waiting", async (t) => {
@@ -300,7 +368,7 @@ test("agent_continue forwards the workspace scope and overrides without waiting"
     },
     wait: async () => {
       waitCalled = true;
-      return Result.ok({ record, timedOut: false });
+      return Result.ok(makeAgentWaitResult(record));
     },
   });
   const context = await fixture(t, {
@@ -397,7 +465,7 @@ test("agent_continue preserves conflict errors without waiting, cancelling, or r
     continue: async () => Result.err(error),
     wait: async () => {
       waitCalled = true;
-      return Result.ok({ record: makeAgentRecord(), timedOut: false });
+      return Result.ok(makeAgentWaitResult(makeAgentRecord()));
     },
     cancel: async () => {
       cancelCalled = true;
@@ -443,7 +511,7 @@ test("agent_cancel forwards the workspace scope and reports an asynchronous requ
     },
     wait: async () => {
       waitCalled = true;
-      return Result.ok({ record, timedOut: false });
+      return Result.ok(makeAgentWaitResult(record));
     },
   });
   const context = await fixture(t, {
@@ -548,7 +616,7 @@ test("agent_wait preserves terminal error record fields", async (t) => {
   });
   const localAgentClient = makeLocalAgentMcpClient({
     start: async () => Result.ok(record),
-    wait: async () => Result.ok({ record, timedOut: false }),
+    wait: async () => Result.ok(makeAgentWaitResult(record)),
   });
   const context = await fixture(t, {
     localAgentProviders: [{ name: "codex", available: true }],
@@ -601,7 +669,7 @@ test("agent_wait rejects timeout values outside the MCP bounds", async (t) => {
   const record = makeAgentRecord({ id: "agt_timeout_validation" });
   const localAgentClient = makeLocalAgentMcpClient({
     start: async () => Result.ok(record),
-    wait: async () => Result.ok({ record, timedOut: false }),
+    wait: async () => Result.ok(makeAgentWaitResult(record)),
   });
   const context = await fixture(t, {
     localAgentProviders: [{ name: "codex", available: true }],
@@ -614,11 +682,13 @@ test("agent_wait rejects timeout values outside the MCP bounds", async (t) => {
     timeoutMs,
   });
 
-  for (const timeoutMs of [0, 20_001, 1.5]) {
+  for (const timeoutMs of [0, 60_001, 1.5]) {
     const response = await input(timeoutMs);
     assert.equal(response.isError, true);
     assert.match(responseText(response), /timeoutMs/);
   }
+  const maximum = await input(60_000);
+  assert.equal(maximum.isError, undefined);
 });
 
 test("agent_start and agent_wait propagate unknown workspace errors", async (t) => {
@@ -631,7 +701,7 @@ test("agent_start and agent_wait propagate unknown workspace errors", async (t) 
     },
     wait: async () => {
       clientCalled = true;
-      return Result.ok({ record, timedOut: false });
+      return Result.ok(makeAgentWaitResult(record));
     },
   });
   const context = await fixture(t, {
@@ -678,7 +748,7 @@ test("agent_get forwards the workspace scope and returns an immediate snapshot",
     },
     wait: async () => {
       waitCalled = true;
-      return Result.ok({ record, timedOut: false });
+      return Result.ok(makeAgentWaitResult(record));
     },
   });
   const context = await fixture(t, {
@@ -1374,7 +1444,7 @@ function makeLocalAgentMcpClient(
   const record = makeAgentRecord();
   return {
     start: async () => Result.ok(record),
-    wait: async () => Result.ok({ record, timedOut: false }),
+    wait: async () => Result.ok(makeAgentWaitResult(record)),
     continue: async () => Result.ok(record),
     cancel: async () => Result.ok(record),
     get: async () => Result.ok(record),
@@ -1390,9 +1460,25 @@ function makeAgentRecord(overrides: Partial<LocalAgentRecord> = {}): LocalAgentR
     profileName: "codex",
     provider: "codex",
     status: "running",
+    activitySequence: 0,
+    activity: [],
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
     ...overrides,
+  };
+}
+
+function makeAgentWaitResult(
+  record: LocalAgentRecord,
+  timedOut = false,
+): AgentWaitResult {
+  return {
+    record,
+    timedOut,
+    wakeReason: timedOut ? "timeout" : "terminal",
+    activitySequence: record.activitySequence,
+    activity: [],
+    activityTruncated: false,
   };
 }
 

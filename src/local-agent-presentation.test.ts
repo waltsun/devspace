@@ -21,6 +21,8 @@ const record: LocalAgentRecord = {
   effort: "high",
   providerSessionId: "provider_private",
   status: "running",
+  activitySequence: 0,
+  activity: [],
   latestResponse: "previous response",
   createdAt: "2026-08-21T10:00:00.000Z",
   updatedAt: "2026-08-21T10:01:00.000Z",

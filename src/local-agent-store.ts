@@ -3,6 +3,13 @@ import { resolve } from "node:path";
 import { Result, type Result as BetterResult } from "better-result";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import { AgentStoreError, isProgrammerDefect } from "./local-agent-errors.js";
+import {
+  LOCAL_AGENT_ACTIVITY_RING_SIZE,
+  readActivityEvent,
+  readActivityRing,
+  type LocalAgentActivityEvent,
+  type LocalAgentActivityInput,
+} from "./local-agent-activity.js";
 
 export type LocalAgentStatus = "starting" | "running" | "idle" | "error" | "stopped";
 
@@ -20,6 +27,9 @@ export interface LocalAgentRecord {
   error?: string;
   errorCode?: string;
   errorRetryable?: boolean;
+  activitySequence: number;
+  lastActivityAt?: string;
+  activity: LocalAgentActivityEvent[];
   createdAt: string;
   updatedAt: string;
 }
@@ -43,6 +53,11 @@ export interface LocalAgentListScope {
   workspaceRoot?: string;
 }
 
+type LocalAgentRecordPatch = Partial<Omit<
+  LocalAgentRecord,
+  "id" | "createdAt" | "activitySequence" | "lastActivityAt" | "activity"
+>>;
+
 interface LocalAgentRow {
   id: string;
   workspace_id: string | null;
@@ -57,6 +72,9 @@ interface LocalAgentRow {
   error: string | null;
   error_code: string | null;
   error_retryable: string | null;
+  activity_sequence: number | null;
+  last_activity_at: string | null;
+  activity_json: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -118,6 +136,8 @@ export class LocalAgentStore {
       model: input.model,
       effort: input.effort,
       status: "starting",
+      activitySequence: 0,
+      activity: [],
       createdAt: now,
       updatedAt: now,
     };
@@ -133,9 +153,11 @@ export class LocalAgentStore {
           model,
           effort,
           status,
+          activity_sequence,
+          activity_json,
           created_at,
           updated_at
-        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         record.id,
@@ -146,6 +168,8 @@ export class LocalAgentStore {
         record.model ?? null,
         record.effort ?? null,
         record.status,
+        record.activitySequence,
+        JSON.stringify(record.activity),
         record.createdAt,
         record.updatedAt,
       );
@@ -180,7 +204,7 @@ export class LocalAgentStore {
     return this.getById(id);
   }
 
-  update(id: string, patch: Partial<Omit<LocalAgentRecord, "id" | "createdAt">>): LocalAgentRecord {
+  update(id: string, patch: LocalAgentRecordPatch): LocalAgentRecord {
     const current = this.getById(id);
     if (!current) throw new Error(`Unknown subagent id: ${id}`);
 
@@ -205,6 +229,9 @@ export class LocalAgentStore {
           error = ?,
           error_code = ?,
           error_retryable = ?,
+          activity_sequence = ?,
+          last_activity_at = ?,
+          activity_json = ?,
           updated_at = ?
          where id = ?`,
       )
@@ -221,6 +248,9 @@ export class LocalAgentStore {
         updated.error ?? null,
         updated.errorCode ?? null,
         updated.errorRetryable === undefined ? null : String(updated.errorRetryable),
+        updated.activitySequence,
+        updated.lastActivityAt ?? null,
+        JSON.stringify(readActivityRing(JSON.stringify(updated.activity))),
         updated.updatedAt,
         updated.id,
       );
@@ -230,13 +260,51 @@ export class LocalAgentStore {
 
   updateResult(
     id: string,
-    patch: Partial<Omit<LocalAgentRecord, "id" | "createdAt">>,
+    patch: LocalAgentRecordPatch,
   ): BetterResult<LocalAgentRecord, AgentStoreError> {
     return storeResult("update", () => this.update(id, patch));
   }
 
+  appendActivity(id: string, input: LocalAgentActivityInput): LocalAgentActivityEvent {
+    const current = this.getById(id);
+    if (!current) throw new Error(`Unknown subagent id: ${id}`);
+    const event = readActivityEvent({
+      ...input,
+      sequence: current.activitySequence + 1,
+      observedAt: new Date().toISOString(),
+    });
+    const activity = [...current.activity, event].slice(-LOCAL_AGENT_ACTIVITY_RING_SIZE);
+    this.database.sqlite
+      .prepare(
+        `update local_agent_sessions set
+          activity_sequence = ?,
+          last_activity_at = ?,
+          activity_json = ?,
+          updated_at = ?
+         where id = ?`,
+      )
+      .run(
+        event.sequence,
+        event.observedAt,
+        JSON.stringify(activity),
+        event.observedAt,
+        id,
+      );
+    return event;
+  }
+
+  appendActivityResult(
+    id: string,
+    input: LocalAgentActivityInput,
+  ): BetterResult<LocalAgentActivityEvent, AgentStoreError> {
+    return storeResult("append_activity", () => this.appendActivity(id, input));
+  }
+
   reconcileActiveRuns(message = "DevSpace restarted while this agent turn was running."): number {
     const now = new Date().toISOString();
+    const active = this.database.sqlite
+      .prepare("select id from local_agent_sessions where status in ('starting', 'running')")
+      .all() as Array<{ id: string }>;
     const result = this.database.sqlite
       .prepare(
         `update local_agent_sessions
@@ -244,6 +312,13 @@ export class LocalAgentStore {
          where status in ('starting', 'running')`,
       )
       .run(message, now);
+    for (const row of active) {
+      this.appendActivity(row.id, {
+        category: "status",
+        kind: "run_failed",
+        status: "failed",
+      });
+    }
     return Number(result.changes);
   }
 
@@ -264,6 +339,11 @@ export function createLocalAgentStore(stateDir: string): LocalAgentStore {
 }
 
 function rowToLocalAgentRecord(row: LocalAgentRow): LocalAgentRecord {
+  const activitySequence = row.activity_sequence ?? 0;
+  const activity = readActivityRing(row.activity_json);
+  if (activity.at(-1)?.sequence && activity.at(-1)!.sequence > activitySequence) {
+    throw new Error("Persisted local-agent activity sequence is behind the retained activity ring.");
+  }
   return {
     id: row.id,
     workspaceId: row.workspace_id ?? undefined,
@@ -278,6 +358,9 @@ function rowToLocalAgentRecord(row: LocalAgentRow): LocalAgentRecord {
     error: row.error ?? undefined,
     errorCode: row.error_code ?? undefined,
     errorRetryable: readOptionalBoolean(row.error_retryable),
+    activitySequence,
+    lastActivityAt: row.last_activity_at ?? undefined,
+    activity,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

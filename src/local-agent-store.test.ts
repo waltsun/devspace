@@ -27,6 +27,25 @@ try {
   assert.equal(store.getById(created.id)?.profileName, "reviewer");
   assert.equal(store.getById(created.id.slice(0, 7)), undefined);
 
+  const firstActivity = store.appendActivity(created.id, {
+    category: "session",
+    kind: "run_started",
+    status: "started",
+  });
+  assert.equal(firstActivity.sequence, 1);
+  for (let index = 0; index < 70; index += 1) {
+    store.appendActivity(created.id, {
+      category: "progress",
+      kind: "progress",
+      status: "updated",
+    });
+  }
+  const activityRecord = store.getById(created.id);
+  assert.equal(activityRecord?.activitySequence, 71);
+  assert.equal(activityRecord?.activity.length, 64);
+  assert.equal(activityRecord?.activity[0]?.sequence, 8);
+  assert.equal(activityRecord?.lastActivityAt, activityRecord?.activity.at(-1)?.observedAt);
+
   const updated = store.update(created.id, {
     status: "error",
     latestResponse: "done",
@@ -137,6 +156,8 @@ assert.deepEqual(store.list({ workspaceRoot: join(root, "other") }), []);
   assert.equal(reloadedRecord?.error, "old error");
   assert.equal(reloadedRecord?.errorCode, "DAEMON_TIMEOUT");
   assert.equal(reloadedRecord?.errorRetryable, true);
+  assert.equal(reloadedRecord?.activitySequence, 0);
+  assert.deepEqual(reloadedRecord?.activity, []);
 } finally {
   for (const store of stores) {
     store.close();

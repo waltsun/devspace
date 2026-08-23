@@ -35,6 +35,10 @@ import {
   isSubagentProviderEnabled,
   type SubagentsConfig,
 } from "./local-agent-config.js";
+import type {
+  LocalAgentActivityEvent,
+  LocalAgentActivityInput,
+} from "./local-agent-activity.js";
 
 export interface StartLocalAgentInput {
   target: string;
@@ -68,7 +72,7 @@ export interface LocalAgentManagerOptions {
 }
 
 export const DEFAULT_AGENT_WAIT_TIMEOUT_MS = 20_000;
-export const MAX_AGENT_WAIT_TIMEOUT_MS = 20_000;
+export const MAX_AGENT_WAIT_TIMEOUT_MS = 60_000;
 
 export type AgentStartError = AgentTargetError | AgentScopeError | AgentConflictError | AgentStoreError;
 export type AgentContinueError = AgentStartError;
@@ -78,12 +82,21 @@ export type AgentCancelError = AgentTargetError | AgentScopeError | AgentConflic
 export interface AgentWaitResult {
   record: LocalAgentRecord;
   timedOut: boolean;
+  wakeReason: "activity" | "terminal" | "timeout";
+  activitySequence: number;
+  activity: LocalAgentActivityEvent[];
+  activityTruncated: boolean;
 }
 export type AgentWaitError = AgentLookupError;
 
 interface ActiveLocalAgentTurn {
   promise: Promise<void>;
   controller: AbortController;
+}
+
+interface ActivityWaiter {
+  afterSequence: number;
+  resolve: (reason: "activity" | "terminal") => void;
 }
 
 /**
@@ -101,6 +114,7 @@ export class LocalAgentManager {
   private readonly logger?: LocalAgentManagerLogger;
   private readonly subagents: SubagentsConfig;
   private readonly activeTurns = new Map<string, ActiveLocalAgentTurn>();
+  private readonly activityWaiters = new Map<string, Set<ActivityWaiter>>();
   private accepting = true;
   private closePromise?: Promise<void>;
 
@@ -214,6 +228,11 @@ export class LocalAgentManager {
       }));
     }
     active.controller.abort();
+    this.appendActivity(agentId, {
+      category: "status",
+      kind: "cancellation_requested",
+      status: "started",
+    });
     this.log("info", "agent_cancel_requested", {
       provider: record.provider,
       agentId: record.id,
@@ -226,8 +245,10 @@ export class LocalAgentManager {
     agentId: string,
     scope: LocalAgentWorkspaceScope,
     timeoutMs: number = DEFAULT_AGENT_WAIT_TIMEOUT_MS,
+    afterSequence?: number,
   ): Promise<BetterResult<AgentWaitResult, AgentWaitError>> {
     assertAgentWaitTimeout(timeoutMs);
+    assertAgentActivityCursor(afterSequence);
     const lookup = this.store.getByIdResult(agentId);
     if (lookup.isErr()) return lookup;
     const record = lookup.value;
@@ -236,7 +257,31 @@ export class LocalAgentManager {
     if (scoped.isErr()) return scoped;
 
     const active = this.activeTurns.get(agentId);
-    if (!active) return Result.ok({ record, timedOut: false });
+    if (!active) return Result.ok(waitResult(record, afterSequence, "terminal", false));
+
+    if (!isActiveRecord(record)) {
+      return Result.ok(waitResult(record, afterSequence, "terminal", false));
+    }
+
+    if (afterSequence !== undefined && record.activitySequence > afterSequence) {
+      return Result.ok(waitResult(record, afterSequence, "activity", false));
+    }
+
+    if (afterSequence !== undefined) {
+      const wakeReason = await this.waitForTurnOrActivity(agentId, active, timeoutMs, afterSequence);
+      const refreshed = this.store.getByIdResult(agentId);
+      if (refreshed.isErr()) return refreshed;
+      if (!refreshed.value) return Result.err(agentNotFound(agentId));
+      const timedOut = wakeReason === "timeout"
+        && this.activeTurns.get(agentId) === active
+        && isActiveRecord(refreshed.value);
+      return Result.ok(waitResult(
+        refreshed.value,
+        afterSequence,
+        timedOut ? wakeReason : wakeReason === "timeout" ? "terminal" : wakeReason,
+        timedOut,
+      ));
+    }
 
     const settled = await waitForTurnSettlement(active.promise, timeoutMs);
     const refreshed = this.store.getByIdResult(agentId);
@@ -246,10 +291,8 @@ export class LocalAgentManager {
     const sameTurnStillActive = this.activeTurns.get(agentId) === active;
     const recordStillRunning = refreshed.value.status === "starting"
       || refreshed.value.status === "running";
-    return Result.ok({
-      record: refreshed.value,
-      timedOut: !settled && sameTurnStillActive && recordStillRunning,
-    });
+    const timedOut = !settled && sameTurnStillActive && recordStillRunning;
+    return Result.ok(waitResult(refreshed.value, undefined, timedOut ? "timeout" : "terminal", timedOut));
   }
 
   get(
@@ -331,6 +374,14 @@ export class LocalAgentManager {
       errorRetryable: undefined,
     });
     if (updated.isErr()) return updated;
+    this.appendActivity(record.id, {
+      category: "session",
+      kind: "run_started",
+      status: "started",
+    });
+    const started = this.store.getByIdResult(record.id);
+    if (started.isErr()) return started;
+    if (!started.value) throw new Error(`Unknown subagent id: ${record.id}`);
     const controller = new AbortController();
     // Defer invocation until after the tracking entry is visible. This keeps
     // cleanup correct even if runTurn later gains a synchronous completion path.
@@ -339,7 +390,7 @@ export class LocalAgentManager {
     ));
     this.activeTurns.set(record.id, { promise: turn, controller });
     void turn.catch(() => undefined);
-    return updated;
+    return Result.ok(started.value);
   }
 
   private async runTurn(
@@ -406,6 +457,14 @@ export class LocalAgentManager {
           if (!current.value || current.value.providerSessionId === providerSessionId) return;
           const updated = this.store.updateResult(record.id, { providerSessionId });
           if (updated.isErr()) throw updated.error;
+          this.appendActivity(record.id, {
+            category: "session",
+            kind: "provider_session_assigned",
+            status: "completed",
+          });
+        },
+        onActivity: (activity) => {
+          this.appendActivity(record.id, activity);
         },
       };
       if (signal.aborted) {
@@ -430,6 +489,11 @@ export class LocalAgentManager {
         errorRetryable: undefined,
       });
       if (updated.isErr()) throw updated.error;
+      this.appendActivity(record.id, {
+        category: "status",
+        kind: "run_completed",
+        status: "completed",
+      });
       this.log("info", "agent_run_completed", {
         provider: updated.value.provider,
         agentId: updated.value.id,
@@ -446,6 +510,11 @@ export class LocalAgentManager {
         error: "Unexpected internal subagent failure.",
         errorCode: "AGENT_INTERNAL_ERROR",
         errorRetryable: false,
+      });
+      this.appendActivity(record.id, {
+        category: "status",
+        kind: "run_failed",
+        status: "failed",
       });
       this.log("error", "agent_run_failed", {
         provider: record.provider,
@@ -472,6 +541,11 @@ export class LocalAgentManager {
       error: error.message,
       errorCode: error.code,
       errorRetryable: error.retryable,
+    });
+    this.appendActivity(record.id, {
+      category: "status",
+      kind: "run_failed",
+      status: "failed",
     });
     this.log("error", "agent_run_failed", {
       provider: record.provider,
@@ -504,6 +578,11 @@ export class LocalAgentManager {
       error: undefined,
       errorCode: undefined,
       errorRetryable: undefined,
+    });
+    this.appendActivity(record.id, {
+      category: "status",
+      kind: "run_cancelled",
+      status: "cancelled",
     });
     this.log("info", "agent_run_cancelled", {
       provider: record.provider,
@@ -689,6 +768,69 @@ export class LocalAgentManager {
     }
   }
 
+  private waitForTurnOrActivity(
+    agentId: string,
+    active: ActiveLocalAgentTurn,
+    timeoutMs: number,
+    afterSequence: number,
+  ): Promise<"activity" | "terminal" | "timeout"> {
+    return new Promise((resolve) => {
+      let finished = false;
+      let timer: NodeJS.Timeout | undefined;
+      let finish!: (reason: "activity" | "terminal" | "timeout") => void;
+      const waiter: ActivityWaiter = {
+        afterSequence,
+        resolve: (reason) => finish(reason),
+      };
+      const waiters = this.activityWaiters.get(agentId) ?? new Set<ActivityWaiter>();
+      waiters.add(waiter);
+      this.activityWaiters.set(agentId, waiters);
+
+      const remove = () => {
+        const current = this.activityWaiters.get(agentId);
+        if (!current) return;
+        current.delete(waiter);
+        if (current.size === 0) this.activityWaiters.delete(agentId);
+      };
+      finish = (reason) => {
+        if (finished) return;
+        finished = true;
+        if (timer) clearTimeout(timer);
+        remove();
+        resolve(reason);
+      };
+
+      void active.promise.then(() => finish("terminal"), () => finish("terminal"));
+      timer = setTimeout(() => finish("timeout"), timeoutMs);
+      timer.unref();
+
+      // Re-read after registration so an append between the initial lookup
+      // and waiter registration cannot be lost.
+      const current = this.store.getByIdResult(agentId);
+      if (current.isOk() && current.value) {
+        if (current.value.activitySequence > afterSequence) finish("activity");
+        else if (!this.activeTurns.has(agentId) || !isActiveRecord(current.value)) finish("terminal");
+      }
+    });
+  }
+
+  private appendActivity(id: string, input: LocalAgentActivityInput): LocalAgentActivityEvent {
+    const result = this.store.appendActivityResult(id, input);
+    if (result.isErr()) throw result.error;
+    this.notifyActivity(id, result.value);
+    return result.value;
+  }
+
+  private notifyActivity(id: string, event: LocalAgentActivityEvent): void {
+    const waiters = this.activityWaiters.get(id);
+    if (!waiters) return;
+    const terminal = event.category === "status"
+      && (event.kind === "run_completed" || event.kind === "run_failed" || event.kind === "run_cancelled");
+    for (const waiter of Array.from(waiters)) {
+      if (event.sequence > waiter.afterSequence) waiter.resolve(terminal ? "terminal" : "activity");
+    }
+  }
+
   private log(
     level: "info" | "warn" | "error",
     event: string,
@@ -728,6 +870,40 @@ function assertAgentWaitTimeout(timeoutMs: number): void {
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_AGENT_WAIT_TIMEOUT_MS) {
     throw new RangeError(`Agent wait timeoutMs must be an integer between 1 and ${MAX_AGENT_WAIT_TIMEOUT_MS}.`);
   }
+}
+
+function assertAgentActivityCursor(afterSequence: number | undefined): void {
+  if (afterSequence !== undefined && (
+    !Number.isSafeInteger(afterSequence) || afterSequence < 0
+  )) {
+    throw new RangeError("Agent wait afterSequence must be a non-negative safe integer.");
+  }
+}
+
+function isActiveRecord(record: LocalAgentRecord): boolean {
+  return record.status === "starting" || record.status === "running";
+}
+
+function waitResult(
+  record: LocalAgentRecord,
+  afterSequence: number | undefined,
+  wakeReason: "activity" | "terminal" | "timeout",
+  timedOut: boolean,
+): AgentWaitResult {
+  const activity = afterSequence === undefined
+    ? []
+    : record.activity.filter((event) => event.sequence > afterSequence);
+  const oldestSequence = record.activity[0]?.sequence;
+  return {
+    record,
+    timedOut,
+    wakeReason,
+    activitySequence: record.activitySequence,
+    activity,
+    activityTruncated: afterSequence !== undefined
+      && oldestSequence !== undefined
+      && afterSequence < oldestSequence - 1,
+  };
 }
 
 async function waitForTurnSettlement(promise: Promise<void>, timeoutMs: number): Promise<boolean> {

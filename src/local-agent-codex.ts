@@ -11,6 +11,7 @@ import {
 } from "./local-agent-errors.js";
 import { removeDevspaceNodeModulesBinFromPath } from "./local-agent-path.js";
 import { terminateProcessTree } from "./process-platform.js";
+import type { LocalAgentActivityInput } from "./local-agent-activity.js";
 import type {
   LocalAgentDriver,
   LocalAgentRunCallbacks,
@@ -338,7 +339,12 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
 
         await callbacks?.onSessionId?.(threadId);
         if (control?.signal?.aborted) throw codexAbortError();
-        const completed = await this.rpc.runTurn(threadId, turnParams(input, threadId), control?.signal);
+        const completed = await this.rpc.runTurn(
+          threadId,
+          turnParams(input, threadId),
+          control?.signal,
+          callbacks?.onActivity,
+        );
         const parsed = parseCompletedTurn(completed.event.params, completed.items);
         if (parsed.status === "interrupted") {
           throw codexAbortError();
@@ -536,6 +542,8 @@ interface CodexTurnAccumulator {
   completed?: CodexEvent;
   abortRequested: boolean;
   interruptStarted: boolean;
+  onActivity?: (activity: LocalAgentActivityInput) => void;
+  lastNoisyActivityAt: number;
   resolve: (result: CodexTurnResult) => void;
   reject: (error: Error) => void;
 }
@@ -575,7 +583,12 @@ class CodexAppServerRpc {
     this.write({ method, ...(params === undefined ? {} : { params }) });
   }
 
-  async runTurn(threadId: string, params: unknown, signal?: AbortSignal): Promise<CodexTurnResult> {
+  async runTurn(
+    threadId: string,
+    params: unknown,
+    signal?: AbortSignal,
+    onActivity?: (activity: LocalAgentActivityInput) => void,
+  ): Promise<CodexTurnResult> {
     if (this.fatalError) throw this.fatalError;
     if (signal?.aborted) throw codexAbortError();
     if (this.turns.has(threadId)) throw new Error(`Codex thread ${threadId} already has an active turn.`);
@@ -590,6 +603,8 @@ class CodexAppServerRpc {
       items: [],
       abortRequested: false,
       interruptStarted: false,
+      onActivity,
+      lastNoisyActivityAt: 0,
       resolve: resolveTurn,
       reject: rejectTurn,
     };
@@ -667,12 +682,22 @@ class CodexAppServerRpc {
     const event = { method, params: message.params };
     const turn = this.findTurn(event);
     if (!turn) return;
+    if (!turnMatchesEvent(turn, event)) return;
     const params = asRecord(event.params);
     if (params?.item !== undefined) {
       turn.items.push(params.item);
       if (turn.items.length > MAX_TURN_ITEMS) turn.items.shift();
     }
-    if (event.method !== "turn/completed" || !turnMatchesEvent(turn, event)) return;
+    const activity = normalizeCodexActivity(event.method, event.params);
+    if (activity && shouldEmitCodexActivity(turn, activity)) {
+      try {
+        turn.onActivity?.(activity);
+      } catch (cause) {
+        this.fail(cause instanceof Error ? cause : new Error(String(cause)));
+        return;
+      }
+    }
+    if (event.method !== "turn/completed") return;
     turn.completed = event;
     turn.resolve({ event, items: turn.items.slice() });
   }
@@ -687,6 +712,192 @@ class CodexAppServerRpc {
     if (!turnId) return undefined;
     return Array.from(this.turns.values()).find((turn) => turn.turnId === turnId);
   }
+}
+
+export function normalizeCodexActivity(
+  method: string,
+  params: unknown,
+): LocalAgentActivityInput | undefined {
+  const record = asRecord(params);
+  const turnId = typeof record?.turnId === "string"
+    ? record.turnId
+    : readString(asRecord(record?.turn), "id");
+  const item = asRecord(record?.item);
+  const providerAt = providerTimestamp(record, item);
+  const itemType = normalizeCodexItemType(item?.type);
+  const itemId = typeof record?.itemId === "string"
+    ? record.itemId
+    : readString(item, "id");
+
+  if (method === "turn/started") {
+    return activity("progress", "turn_started", "started", turnId, undefined, providerAt);
+  }
+  if (method === "turn/completed") {
+    const status = readString(asRecord(record?.turn), "status");
+    return activity(
+      "status",
+      "turn_completed",
+      status === "failed" ? "failed" : status === "interrupted" ? "cancelled" : "completed",
+      turnId,
+      undefined,
+      providerAt,
+    );
+  }
+
+  if (method === "turn/diff/updated") {
+    return activity("edit", "diff_updated", "updated", turnId, undefined, providerAt);
+  }
+  if (method === "turn/plan/updated") {
+    return activity("progress", "plan_updated", "updated", turnId, undefined, providerAt);
+  }
+  if (method === "thread/tokenUsage/updated") {
+    return activity("progress", "token_usage_updated", "updated", turnId, undefined, providerAt);
+  }
+  if (method === "model/safetyBuffering/updated") {
+    return activity("progress", "safety_buffer_updated", "updated", turnId, undefined, providerAt);
+  }
+  if (method === "warning") {
+    return activity("status", "warning", "updated", turnId, undefined, providerAt);
+  }
+  if (method === "error") {
+    return activity("status", "provider_error", "failed", turnId, undefined, providerAt);
+  }
+
+  if (method === "item/started" || method === "item/completed") {
+    if (!itemType) return undefined;
+    return itemActivity(itemType, method === "item/started" ? "started" : "completed", turnId, itemId, item, providerAt);
+  }
+
+  const delta = deltaActivity(method, turnId, itemId, providerAt);
+  if (delta) return delta;
+  return undefined;
+}
+
+function itemActivity(
+  itemType: string,
+  status: LocalAgentActivityInput["status"],
+  turnId: string | undefined,
+  itemId: string | undefined,
+  item: Record<string, unknown> | undefined,
+  providerAt: string | undefined,
+): LocalAgentActivityInput | undefined {
+  switch (itemType) {
+    case "commandExecution":
+      return activity("command", "command_execution", status, turnId, itemId, providerAt);
+    case "fileChange": {
+      const changes = item?.changes;
+      return {
+        ...activity("edit", "file_change", status, turnId, itemId, providerAt),
+        ...(Array.isArray(changes) ? { pathCount: changes.length } : {}),
+      };
+    }
+    case "agentMessage":
+      return activity("assistant", "assistant_message", status, turnId, itemId, providerAt);
+    case "webSearch":
+      return activity("search", "web_search", status, turnId, itemId, providerAt);
+    case "fileRead":
+      return activity("read", "file_read", status, turnId, itemId, providerAt);
+    default:
+      return undefined;
+  }
+}
+
+function deltaActivity(
+  method: string,
+  turnId: string | undefined,
+  itemId: string | undefined,
+  providerAt: string | undefined,
+): LocalAgentActivityInput | undefined {
+  const status = method.endsWith("/started")
+    ? "started"
+    : method.endsWith("/completed")
+      ? "completed"
+      : "updated";
+  if (method.includes("agentMessage/delta")) {
+    return activity("assistant", "assistant_delta", "updated", turnId, itemId, providerAt);
+  }
+  if (method.includes("agentMessage/") || method.includes("agent_message/")) {
+    return activity("assistant", "assistant_updated", status, turnId, itemId, providerAt);
+  }
+  if (method.includes("commandExecution/") || method.includes("command_execution/")) {
+    return activity("command", "command_updated", status, turnId, itemId, providerAt);
+  }
+  if (method.includes("fileChange/") || method.includes("file_change/")) {
+    return activity("edit", "file_change_updated", status, turnId, itemId, providerAt);
+  }
+  if (method.includes("webSearch/") || method.includes("web_search/")) {
+    return activity("search", "web_search_updated", status, turnId, itemId, providerAt);
+  }
+  if (method.includes("fileRead/") || method.includes("file_read/")) {
+    return activity("read", "file_read_updated", status, turnId, itemId, providerAt);
+  }
+  if (method.includes("reasoning/") || method.includes("plan/") || method.includes("mcpToolCall/")) {
+    return activity("progress", "provider_progress", "updated", turnId, itemId, providerAt);
+  }
+  return undefined;
+}
+
+function activity(
+  category: LocalAgentActivityInput["category"],
+  kind: string,
+  status: LocalAgentActivityInput["status"],
+  turnId: string | undefined,
+  itemId: string | undefined,
+  providerAt: string | undefined,
+): LocalAgentActivityInput {
+  return {
+    category,
+    kind,
+    ...(status === undefined ? {} : { status }),
+    ...(turnId === undefined ? {} : { turnId }),
+    ...(itemId === undefined ? {} : { itemId }),
+    ...(providerAt === undefined ? {} : { providerAt }),
+  };
+}
+
+function normalizeCodexItemType(value: unknown): string | undefined {
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  switch (value) {
+    case "agent_message": return "agentMessage";
+    case "command_execution": return "commandExecution";
+    case "file_change": return "fileChange";
+    case "web_search": return "webSearch";
+    case "search": return "webSearch";
+    case "file_read":
+    case "read": return "fileRead";
+    default: return value;
+  }
+}
+
+function providerTimestamp(
+  params: Record<string, unknown> | undefined,
+  item: Record<string, unknown> | undefined,
+): string | undefined {
+  const values = [
+    params?.timestamp,
+    asRecord(params?.turn)?.timestamp,
+    item?.timestamp,
+  ];
+  for (const value of values) {
+    if (typeof value !== "string" || !value.trim()) continue;
+    const parsed = Date.parse(value);
+    if (!Number.isNaN(parsed)) return new Date(parsed).toISOString();
+  }
+  return undefined;
+}
+
+function shouldEmitCodexActivity(
+  turn: CodexTurnAccumulator,
+  activity: LocalAgentActivityInput,
+): boolean {
+  const noisy = activity.kind.includes("delta")
+    || activity.kind.includes("updated")
+    || activity.kind === "provider_progress";
+  if (!noisy) return true;
+  const now = Date.now();
+  if (now - turn.lastNoisyActivityAt < 500) return false;
+  turn.lastNoisyActivityAt = now;
+  return true;
 }
 
 function threadParams(input: LocalAgentRunInput): Record<string, unknown> {
@@ -735,7 +946,8 @@ function parseCompletedTurn(params: unknown, items: unknown[]): {
   failure?: string;
 } {
   const turn = asRecord(asRecord(params)?.turn);
-  const completedItems = (Array.isArray(turn?.items) ? turn.items : items).slice(-MAX_TURN_ITEMS);
+  const turnItems = Array.isArray(turn?.items) ? turn.items : [];
+  const completedItems = (turnItems.length > 0 ? turnItems : items).slice(-MAX_TURN_ITEMS);
   let finalResponse = "";
   for (const item of completedItems) {
     const record = asRecord(item);
