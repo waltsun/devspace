@@ -39,8 +39,8 @@ export function resolveShellCommand(
 ): ShellCommand {
   if (platform === "win32") {
     return {
-      executable: environment.ComSpec ?? environment.COMSPEC ?? "cmd.exe",
-      args: ["/d", "/s", "/c", command],
+      executable: "pwsh.exe",
+      args: ["-NoLogo", "-NoProfile", "-Command", command],
     };
   }
 

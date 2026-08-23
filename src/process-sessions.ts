@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
 
 const DEFAULT_EXEC_YIELD_MS = 10_000;
-const DEFAULT_INTERACTIVE_YIELD_MS = 250;
+const DEFAULT_INTERACTIVE_YIELD_MS = process.platform === "win32" ? 1_000 : 250;
 const DEFAULT_POLL_YIELD_MS = 5_000;
 const MAX_COMMAND_YIELD_MS = 30_000;
 const MAX_POLL_YIELD_MS = 110_000;
@@ -325,7 +325,7 @@ export class ProcessSessionManager {
   private startPipe(session: ProcessSession, input: StartCommandInput): void {
     const shell = resolveShellCommand(input.command);
     const detached = process.platform !== "win32";
-    const child = spawn(input.command, {
+    const child = spawn(shell.executable, shell.args, {
       cwd: input.cwd,
       env: processEnvironment({
         workspaceId: input.workspaceId,
@@ -334,7 +334,6 @@ export class ProcessSessionManager {
       stdio: "pipe",
       windowsHide: true,
       detached,
-      shell: shell.executable,
     });
 
     session.process = {

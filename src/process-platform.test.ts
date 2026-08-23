@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
 
-assert.deepEqual(resolveShellCommand("echo ok", "win32", { ComSpec: "C:\\Windows\\cmd.exe" }), {
-  executable: "C:\\Windows\\cmd.exe",
-  args: ["/d", "/s", "/c", "echo ok"],
+assert.deepEqual(resolveShellCommand("Write-Output 'ok'", "win32", { ComSpec: "C:\\Windows\\cmd.exe" }), {
+  executable: "pwsh.exe",
+  args: ["-NoLogo", "-NoProfile", "-Command", "Write-Output 'ok'"],
 });
 
 assert.deepEqual(resolveShellCommand("echo ok", "darwin", { SHELL: "/bin/zsh" }), {

@@ -34,8 +34,30 @@ const manager = new ProcessSessionManager({
 });
 
 const node = process.platform === "win32"
-  ? `"${process.execPath}"`
+  ? `& "${process.execPath}"`
   : JSON.stringify(process.execPath);
+
+if (process.platform === "win32") {
+  const powershell = await manager.start({
+    workspaceId: "workspace-a",
+    cwd: process.cwd(),
+    command: "Write-Output 'powershell-ok'; $PSVersionTable.PSVersion.ToString()",
+    yieldTimeMs: 2_000,
+  });
+  assert.equal(powershell.running, false);
+  assert.equal(powershell.exitCode, 0);
+  assert.match(powershell.output, /powershell-ok/);
+  assert.match(powershell.output, /7\./);
+
+  const exitCode = await manager.start({
+    workspaceId: "workspace-a",
+    cwd: process.cwd(),
+    command: "exit 7",
+    yieldTimeMs: 2_000,
+  });
+  assert.equal(exitCode.running, false);
+  assert.equal(exitCode.exitCode, 7);
+}
 
 const foreground = await manager.start({
   workspaceId: "workspace-a",
@@ -183,12 +205,14 @@ try {
     const pty = await manager.start({
       workspaceId: "workspace-a",
       cwd: process.cwd(),
-      command: "echo pty-ok",
+      command: "Write-Output 'pty-powershell-ok'; $PSVersionTable.PSVersion.ToString()",
       tty: true,
       yieldTimeMs: 10_000,
     });
     assert.equal(pty.running, false);
-    assert.match(pty.output, /pty-ok/);
+    assert.equal(pty.exitCode, 0);
+    assert.match(pty.output, /pty-powershell-ok/);
+    assert.match(pty.output, /7\./);
   } else {
     const pty = await manager.start({
       workspaceId: "workspace-a",
