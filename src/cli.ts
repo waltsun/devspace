@@ -397,6 +397,7 @@ function printHelp(): void {
       "  devspace agents ls       List subagent sessions",
       "  devspace agents run <profile-or-provider> [--model <model>] [--effort <level>] <prompt>",
       "  devspace agents continue <id> [--model <model>] [--effort <level>] <prompt>",
+      "  devspace agents cancel <id>",
       "  devspace agents show <id>",
       "  devspace agents daemon <status|stop|logs>",
       "  devspace -v, --version   Print the installed version",
@@ -515,6 +516,9 @@ async function runAgentsCommand(args: string[]): Promise<void> {
     case "continue":
       await runAgentsContinue(commandArgs, json);
       return;
+    case "cancel":
+      await runAgentsCancel(commandArgs, json);
+      return;
     case "show":
       await runAgentsShow(commandArgs, json);
       return;
@@ -614,6 +618,24 @@ async function runAgentsContinue(args: string[], json: boolean): Promise<void> {
     return;
   }
   console.log(formatAgentReceipt(receipt));
+}
+
+async function runAgentsCancel(args: string[], json: boolean): Promise<void> {
+  const [id, ...extra] = args;
+  if (!id || extra.length > 0) throw new Error("Usage: devspace agents cancel <id> [--json]");
+
+  const config = loadConfig();
+  const client = createLocalAgentClient(config);
+  const scope = resolveCliWorkspaceContext(config.allowedRoots);
+  const record = presentAgentResult(await client.cancel(id, scope), json);
+  if (!record) return;
+
+  const receipt = presentAgentReceipt(record);
+  if (json) {
+    printJson({ ...receipt, cancelRequested: true });
+    return;
+  }
+  console.log(`Cancellation requested: ${formatAgentReceipt(receipt)}`);
 }
 
 async function runAgentsShow(args: string[], json: boolean): Promise<void> {
@@ -720,6 +742,7 @@ function printAgentsHelp(): void {
       "  devspace agents ls [--json]",
       "  devspace agents run <profile-or-provider> [--model <model>] [--effort <level>] [--json] <prompt>",
       "  devspace agents continue <id> [--model <model>] [--effort <level>] [--json] <prompt>",
+      "  devspace agents cancel <id> [--json]",
       "  devspace agents show <id> [--json]",
       "  devspace agents targets [--json]",
       "  devspace agents daemon <status|stop|logs> [--json]",

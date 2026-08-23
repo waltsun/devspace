@@ -8,7 +8,10 @@ import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { loadConfig } from "./config.js";
-import { localAgentDaemonPaths } from "./local-agent-daemon-lifecycle.js";
+import {
+  LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
+  localAgentDaemonPaths,
+} from "./local-agent-daemon-lifecycle.js";
 import { encodeLocalAgentDaemonResponse } from "./local-agent-daemon-protocol.js";
 import { LocalAgentStore } from "./local-agent-store.js";
 
@@ -94,7 +97,7 @@ try {
       if (request.method === "agent.start") {
         socket.end(encodeLocalAgentDaemonResponse({
           requestId: request.requestId,
-          protocolVersion: 4,
+          protocolVersion: LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
           ok: false,
           error: {
             code: "UNKNOWN_TARGET",
@@ -105,24 +108,41 @@ try {
         }));
         return;
       }
+      if (request.method === "agent.cancel" && request.params?.id === other.id) {
+        socket.end(encodeLocalAgentDaemonResponse({
+          requestId: request.requestId,
+          protocolVersion: LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
+          ok: false,
+          error: {
+            code: "AGENT_CONFLICT",
+            message: `Agent ${other.id} has no active turn to cancel.`,
+            retryable: false,
+            agentId: other.id,
+            operation: "cancel",
+          },
+        }));
+        return;
+      }
       const result = request.method === "agent.list"
         ? [current]
-        : request.method === "hello"
-          ? {
-              state: "ready",
-              protocolVersion: 4,
-              pid: process.pid,
-              endpoint: daemonSocket,
-              host: { pid: process.pid, platform: "win32", windowsSessionId: 1, interactive: true },
-              startedAt: "now",
-              activeTurns: 0,
-              runtimeCount: 0,
-              clientConnections: 1,
-            }
-          : null;
+        : request.method === "agent.cancel"
+          ? { ...current, status: "running" }
+          : request.method === "hello"
+            ? {
+                state: "ready",
+                protocolVersion: LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
+                pid: process.pid,
+                endpoint: daemonSocket,
+                host: { pid: process.pid, platform: "win32", windowsSessionId: 1, interactive: true },
+                startedAt: "now",
+                activeTurns: 0,
+                runtimeCount: 0,
+                clientConnections: 1,
+              }
+            : null;
       socket.end(encodeLocalAgentDaemonResponse({
         requestId: request.requestId,
-        protocolVersion: 4,
+        protocolVersion: LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
         ok: true,
         result,
       }));
@@ -195,6 +215,68 @@ try {
     assert.match(directOutput, new RegExp(current.id));
     const directList = [...daemonRequests].reverse().find((request) => request.method === "agent.list");
     assert.deepEqual(directList?.params, { workspaceRoot: realpathSync.native(projectRoot) });
+
+    const cancelEnv = {
+      ...process.env,
+      DEVSPACE_CONFIG_DIR: configDir,
+      DEVSPACE_ALLOWED_ROOTS: projectRoot,
+      DEVSPACE_STATE_DIR: stateDir,
+      DEVSPACE_WORKSPACE_ID: "ws_current",
+      DEVSPACE_WORKSPACE_ROOT: projectRoot,
+      DEVSPACE_SUBAGENTS: "1",
+      DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    };
+    const { stdout: cancelOutput } = await execFileAsync(
+      "node",
+      ["--import", tsxLoader, cliPath, "agents", "cancel", current.id],
+      { cwd: process.cwd(), encoding: "utf8", env: cancelEnv },
+    );
+    assert.equal(cancelOutput.trim(), `Cancellation requested: ${current.id} running`);
+    const cancelRequest = [...daemonRequests].reverse().find((request) => request.method === "agent.cancel");
+    assert.deepEqual(cancelRequest?.params, {
+      id: current.id,
+      scope: { workspaceId: "ws_current", workspaceRoot: realpathSync.native(projectRoot) },
+    });
+
+    const { stdout: cancelJsonOutput } = await execFileAsync(
+      "node",
+      ["--import", tsxLoader, cliPath, "agents", "cancel", current.id, "--json"],
+      { cwd: process.cwd(), encoding: "utf8", env: cancelEnv },
+    );
+    assert.deepEqual(JSON.parse(cancelJsonOutput), {
+      id: current.id,
+      status: "running",
+      cancelRequested: true,
+    });
+
+    let cancelFailure: unknown;
+    try {
+      await execFileAsync(
+        "node",
+        ["--import", tsxLoader, cliPath, "agents", "cancel", other.id, "--json"],
+        { cwd: process.cwd(), encoding: "utf8", env: cancelEnv },
+      );
+    } catch (error) {
+      cancelFailure = error;
+    }
+    assert.ok(cancelFailure, "cancel conflicts should exit non-zero");
+    const cancelErrorPayload = JSON.parse((cancelFailure as { stdout?: string }).stdout ?? "") as {
+      error: { code: string; operation: string };
+    };
+    assert.equal(cancelErrorPayload.error.code, "AGENT_CONFLICT");
+    assert.equal(cancelErrorPayload.error.operation, "cancel");
+
+    await assert.rejects(
+      execFileAsync(
+        "node",
+        ["--import", tsxLoader, cliPath, "agents", "cancel"],
+        { cwd: process.cwd(), encoding: "utf8", env: cancelEnv },
+      ),
+      (error: unknown) => {
+        assert.match((error as { stderr?: string }).stderr ?? "", /Usage: devspace agents cancel <id>/);
+        return true;
+      },
+    );
 
     let commandFailure: unknown;
     try {

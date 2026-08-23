@@ -15,6 +15,7 @@ export type LocalAgentDaemonMethod =
   | "agent.start"
   | "agent.continue"
   | "agent.get"
+  | "agent.cancel"
   | "agent.list"
   | "daemon.status"
   | "daemon.stop"
@@ -25,6 +26,7 @@ export type LocalAgentDaemonRequest =
   | AgentDaemonRequestBase<"agent.start", StartLocalAgentInput>
   | AgentDaemonRequestBase<"agent.continue", { id: string; prompt: string; scope: LocalAgentWorkspaceScope; overrides?: RunOverrides }>
   | AgentDaemonRequestBase<"agent.get", { id: string; scope: LocalAgentWorkspaceScope }>
+  | AgentDaemonRequestBase<"agent.cancel", { id: string; scope: LocalAgentWorkspaceScope }>
   | AgentDaemonRequestBase<"agent.list", LocalAgentWorkspaceScope>
   | AgentDaemonRequestBase<"daemon.status", Record<string, never>>
   | AgentDaemonRequestBase<"daemon.stop", Record<string, never>>
@@ -122,15 +124,13 @@ export function decodeLocalAgentDaemonRequest(value: unknown): LocalAgentDaemonR
         params: decodeContinueInput(params),
       } as LocalAgentDaemonRequest;
     case "agent.get":
+    case "agent.cancel":
       return {
         requestId,
         protocolVersion,
         method,
         authToken,
-        params: {
-          id: requiredString(asRecord(params)?.id, "id"),
-          scope: decodeWorkspaceScope(asRecord(params)?.scope),
-        },
+        params: decodeAgentScopedIdParams(params),
       } as LocalAgentDaemonRequest;
     case "agent.list":
       return {
@@ -314,6 +314,17 @@ function decodeWorkspaceScope(value: unknown): LocalAgentWorkspaceScope {
 
 function decodeListScope(value: unknown): LocalAgentWorkspaceScope {
   return decodeWorkspaceScope(value);
+}
+
+function decodeAgentScopedIdParams(value: unknown): {
+  id: string;
+  scope: LocalAgentWorkspaceScope;
+} {
+  const record = asRecord(value);
+  return {
+    id: requiredString(record?.id, "id"),
+    scope: decodeWorkspaceScope(record?.scope),
+  };
 }
 
 function decodeLogsParams(value: unknown): { lines?: number } {

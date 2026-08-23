@@ -59,11 +59,11 @@ async function runHelloServer(root: string, windowsSessionId: number): Promise<{
       const request = JSON.parse(buffer.slice(0, newline)) as { requestId: string };
       socket.end(encodeLocalAgentDaemonResponse({
         requestId: request.requestId,
-        protocolVersion: 4,
+        protocolVersion: 5,
         ok: true,
         result: {
           state: "ready",
-          protocolVersion: 4,
+          protocolVersion: 5,
           pid: process.pid,
           host: {
             pid: process.pid,

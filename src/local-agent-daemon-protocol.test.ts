@@ -7,10 +7,13 @@ import {
   encodeLocalAgentDaemonResponse,
   LocalAgentDaemonProtocolError,
 } from "./local-agent-daemon-protocol.js";
+import { LOCAL_AGENT_DAEMON_PROTOCOL_VERSION } from "./local-agent-daemon-lifecycle.js";
+
+assert.equal(LOCAL_AGENT_DAEMON_PROTOCOL_VERSION, 5);
 
 const request = decodeLocalAgentDaemonRequest({
   requestId: "req_1",
-  protocolVersion: 4,
+  protocolVersion: LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
   authToken: "test-secret",
   method: "agent.start",
   params: {
@@ -28,7 +31,7 @@ assert.match(encodeLocalAgentDaemonRequest(request), /"method":"agent.start"/);
 
 const whitespaceRequest = decodeLocalAgentDaemonRequest({
   requestId: "req_whitespace",
-  protocolVersion: 4,
+  protocolVersion: LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
   authToken: "test-secret",
   method: "agent.start",
   params: {
@@ -43,7 +46,7 @@ assert.equal(whitespaceRequest.params.prompt, "  keep prompt whitespace  \n");
 
 const directRequest = decodeLocalAgentDaemonRequest({
   requestId: "req_direct",
-  protocolVersion: 4,
+  protocolVersion: LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
   authToken: "test-secret",
   method: "agent.start",
   params: {
@@ -58,7 +61,7 @@ assert.equal(directRequest.params.workspaceId, undefined);
 assert.throws(
   () => decodeLocalAgentDaemonRequest({
     requestId: "req_2",
-    protocolVersion: 4,
+    protocolVersion: LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
     authToken: "test-secret",
     method: "agent.start",
     params: { target: "reviewer", prompt: "" },
@@ -85,7 +88,7 @@ assert.equal(directRecord.workspaceId, undefined);
 
 const response = decodeLocalAgentDaemonResponse({
   requestId: "req_1",
-  protocolVersion: 4,
+  protocolVersion: LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
   ok: true,
   result: record,
 });
@@ -93,7 +96,7 @@ assert.equal(response.ok, true);
 
 const errorResponse = decodeLocalAgentDaemonResponse(JSON.parse(encodeLocalAgentDaemonResponse({
   requestId: "req_error",
-  protocolVersion: 4,
+  protocolVersion: LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
   ok: false,
   error: {
     code: "PROVIDER_UNAVAILABLE",
@@ -111,6 +114,38 @@ if (!errorResponse.ok) {
   assert.equal(errorResponse.error.provider, "codex");
   assert.equal(errorResponse.error.agentId, "agt_1234");
   assert.equal(errorResponse.error.operation, "create_runtime");
+}
+
+const cancelScope = { workspaceRoot: "/workspace", workspaceId: "ws_test" };
+const cancelRequest = decodeLocalAgentDaemonRequest({
+  requestId: "req_cancel",
+  protocolVersion: LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
+  authToken: "test-secret",
+  method: "agent.cancel",
+  params: { id: "agt_test", scope: cancelScope },
+});
+assert.equal(cancelRequest.method, "agent.cancel");
+if (cancelRequest.method !== "agent.cancel") throw new Error("expected agent.cancel request");
+assert.deepEqual(cancelRequest.params, { id: "agt_test", scope: cancelScope });
+
+for (const params of [
+  {},
+  { id: "agt_test" },
+  { scope: cancelScope },
+  { id: "", scope: cancelScope },
+  { id: "agt_test", scope: { workspaceId: "ws_test" } },
+  { id: "agt_test", scope: { workspaceRoot: 42 } },
+]) {
+  assert.throws(
+    () => decodeLocalAgentDaemonRequest({
+      requestId: "req_invalid_cancel",
+      protocolVersion: LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
+      authToken: "test-secret",
+      method: "agent.cancel",
+      params,
+    }),
+    (error: unknown) => error instanceof LocalAgentDaemonProtocolError && error.code === "INVALID_PARAMS",
+  );
 }
 
 const failedRecord = decodeAgentRecord({

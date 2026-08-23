@@ -16,6 +16,7 @@ import {
 import {
   encodeLocalAgentDaemonResponse,
 } from "./local-agent-daemon-protocol.js";
+import { AgentConflictError } from "./local-agent-errors.js";
 import type { RunOverrides, StartLocalAgentInput } from "./local-agent-manager.js";
 import type { LocalAgentRecord } from "./local-agent-store.js";
 
@@ -36,6 +37,9 @@ class FakeManager implements LocalAgentDaemonManager {
   runtimeCount = 0;
   closed = false;
   lastInput?: StartLocalAgentInput;
+  lastCancel?: { agentId: string; scope: { workspaceId?: string; workspaceRoot: string } };
+  cancelCalls = 0;
+  cancelError = false;
 
   async start(input: StartLocalAgentInput) {
     this.lastInput = input;
@@ -48,6 +52,21 @@ class FakeManager implements LocalAgentDaemonManager {
     _overrides: RunOverrides | undefined,
     _scope: { workspaceId: string; workspaceRoot: string },
   ) {
+    return Result.ok({ ...record, status: "running" } as LocalAgentRecord);
+  }
+
+  cancel(agentId: string, scope: { workspaceId?: string; workspaceRoot: string }) {
+    this.cancelCalls += 1;
+    this.lastCancel = { agentId, scope };
+    if (this.cancelError) {
+      return Result.err(new AgentConflictError({
+        code: "AGENT_CONFLICT",
+        agentId,
+        operation: "cancel",
+        retryable: false,
+        message: `Agent ${agentId} has no active turn to cancel.`,
+      }));
+    }
     return Result.ok({ ...record, status: "running" } as LocalAgentRecord);
   }
 
@@ -127,6 +146,19 @@ try {
   const recordScope = { workspaceId: record.workspaceId!, workspaceRoot: record.workspaceRoot };
   assert.equal(unwrap(await client.get(record.id, recordScope)).id, record.id);
   assert.equal(unwrap(await client.list(recordScope))[0]?.id, record.id);
+  const cancelled = unwrap(await client.cancel(record.id, recordScope));
+  assert.equal(cancelled.status, "running", "cancel returns an acknowledgement record immediately");
+  assert.equal(manager.cancelCalls, 1);
+  assert.deepEqual(manager.lastCancel, { agentId: record.id, scope: recordScope });
+  manager.cancelError = true;
+  const cancelConflict = await client.cancel(record.id, recordScope);
+  assert.equal(cancelConflict.isErr(), true);
+  if (cancelConflict.isErr()) {
+    assert.equal(cancelConflict.error.code, "AGENT_CONFLICT");
+    assert.equal(cancelConflict.error.operation, "cancel");
+  }
+  assert.equal(manager.cancelCalls, 2);
+  manager.cancelError = false;
   assert.equal(unwrap(await client.status()).state, "ready");
 
   unwrap(await client.stop());
@@ -311,10 +343,10 @@ const upgradeClient = new LocalAgentClient({
   },
 });
 try {
-  assert.equal(unwrap(await upgradeClient.ensureReady()).protocolVersion, 4);
+  assert.equal(unwrap(await upgradeClient.ensureReady()).protocolVersion, LOCAL_AGENT_DAEMON_PROTOCOL_VERSION);
   assert.equal(replacementSpawns, 1);
   assert.equal(spawnedBeforeLegacyLockReleased, false);
-  assert.deepEqual(legacyMethods.slice(0, 3), ["hello:4", "hello:1", "daemon.stop:1"]);
+  assert.deepEqual(legacyMethods.slice(0, 3), [`hello:${LOCAL_AGENT_DAEMON_PROTOCOL_VERSION}`, "hello:1", "daemon.stop:1"]);
 } finally {
   legacyLock.release();
   await replacementDaemon.close();
@@ -409,11 +441,11 @@ const timeoutServer = createNetServer((socket) => {
     if (request.method !== "hello") return;
     socket.end(encodeLocalAgentDaemonResponse({
       requestId: request.requestId,
-      protocolVersion: 4,
+      protocolVersion: LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
       ok: true,
       result: {
         state: "ready",
-        protocolVersion: 4,
+        protocolVersion: LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
         pid: process.pid,
         endpoint: timeoutPaths.endpoint,
         host: { pid: process.pid, platform: "win32", windowsSessionId: 1, interactive: true },
@@ -457,7 +489,7 @@ const invalidServer = createNetServer((socket) => {
     if (!buffer.includes("\n")) return;
     socket.end(encodeLocalAgentDaemonResponse({
       requestId: "wrong_request_id",
-      protocolVersion: 4,
+      protocolVersion: LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
       ok: true,
       result: {},
     }));
@@ -512,7 +544,7 @@ try {
 
   const unauthorized = await sendRawRequest(socketDaemon.paths.endpoint, JSON.stringify({
     requestId: "unauthorized",
-    protocolVersion: 4,
+    protocolVersion: LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
     authToken: "wrong-secret",
     method: "hello",
     params: {},
