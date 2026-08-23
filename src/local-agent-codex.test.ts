@@ -195,6 +195,21 @@ assert.equal(
   undefined,
 );
 
+if (process.platform === "win32") {
+  const root = await mkdtemp(join(tmpdir(), "devspace-codex-command-resolution-test-"));
+  try {
+    const command = join(root, "codex.CMD");
+    await writeFile(command, "@echo off\r\necho codex-cli 9.8.7\r\n");
+    assert.deepEqual(
+      resolveCodexCommand({ Path: root, PathExt: ".CMD" }),
+      { executable: command, version: "9.8.7" },
+      "Windows command resolution must treat PATH and PATHEXT names case-insensitively",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
 if (process.platform !== "win32") {
   const root = await mkdtemp(join(tmpdir(), "devspace-codex-app-server-test-"));
   const badBin = join(root, "bad-bin");
