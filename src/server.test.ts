@@ -12,7 +12,11 @@ import { loadConfig, type ServerConfig } from "./config.js";
 import type { LocalAgentProviderAvailability } from "./local-agent-availability.js";
 import { buildLocalAgentProviderStatuses } from "./local-agent-catalog.js";
 import type { SubagentsConfig } from "./local-agent-config.js";
-import { AgentConflictError, AgentTargetError } from "./local-agent-errors.js";
+import {
+  AgentConflictError,
+  AgentDaemonUnavailableError,
+  AgentTargetError,
+} from "./local-agent-errors.js";
 import type { LocalAgentRecord } from "./local-agent-store.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { ProcessSessionManager } from "./process-sessions.js";
@@ -29,6 +33,8 @@ test("agent controller tools are exposed only when subagents are enabled", async
   assert.equal(disabledTools.some((tool) => tool.name === "agent_wait"), false);
   assert.equal(disabledTools.some((tool) => tool.name === "agent_continue"), false);
   assert.equal(disabledTools.some((tool) => tool.name === "agent_cancel"), false);
+  assert.equal(disabledTools.some((tool) => tool.name === "agent_get"), false);
+  assert.equal(disabledTools.some((tool) => tool.name === "agent_list"), false);
 
   const enabled = await fixture(t, {
     localAgentProviders: [{ name: "codex", available: true }],
@@ -38,10 +44,14 @@ test("agent controller tools are exposed only when subagents are enabled", async
   const waitTool = enabledTools.find((tool) => tool.name === "agent_wait");
   const continueTool = enabledTools.find((tool) => tool.name === "agent_continue");
   const cancelTool = enabledTools.find((tool) => tool.name === "agent_cancel");
+  const getTool = enabledTools.find((tool) => tool.name === "agent_get");
+  const listTool = enabledTools.find((tool) => tool.name === "agent_list");
   assert.ok(startTool);
   assert.ok(waitTool);
   assert.ok(continueTool);
   assert.ok(cancelTool);
+  assert.ok(getTool);
+  assert.ok(listTool);
   assert.deepEqual(startTool.annotations, {
     readOnlyHint: false,
     destructiveHint: true,
@@ -70,6 +80,20 @@ test("agent controller tools are exposed only when subagents are enabled", async
   assert.deepEqual(waitTool._meta, {});
   assert.deepEqual(continueTool._meta, {});
   assert.deepEqual(cancelTool._meta, {});
+  assert.deepEqual(getTool.annotations, {
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  });
+  assert.deepEqual(listTool.annotations, {
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  });
+  assert.deepEqual(getTool._meta, {});
+  assert.deepEqual(listTool._meta, {});
 });
 
 test("agent_start resolves the workspace and returns without waiting", async (t) => {
@@ -579,6 +603,307 @@ test("agent_start and agent_wait propagate unknown workspace errors", async (t) 
   assert.equal(clientCalled, false);
 });
 
+test("agent_get forwards the workspace scope and returns an immediate snapshot", async (t) => {
+  let getAgentId: string | undefined;
+  let getScope: Parameters<LocalAgentMcpClient["get"]>[1] | undefined;
+  let waitCalled = false;
+  const record = makeAgentRecord({
+    id: "agt_get_running",
+    profileName: "codex-luna",
+    provider: "codex",
+    status: "running",
+    model: "gpt-test",
+    effort: "high",
+    providerSessionId: "provider-session-get",
+    latestResponse: "latest response",
+  });
+  const localAgentClient = makeLocalAgentMcpClient({
+    get: async (agentId, scope) => {
+      getAgentId = agentId;
+      getScope = scope;
+      return Result.ok(record);
+    },
+    wait: async () => {
+      waitCalled = true;
+      return Result.ok({ record, timedOut: false });
+    },
+  });
+  const context = await fixture(t, {
+    localAgentProviders: [{ name: "codex", available: true }],
+    localAgentClient,
+  });
+  const opened = structuredContent(await callOpen(context.client, context.project));
+
+  const response = await callAgentGet(context.client, {
+    workspaceId: opened.workspaceId,
+    agentId: record.id,
+  });
+
+  assert.equal(getAgentId, record.id);
+  assert.deepEqual(getScope, {
+    workspaceId: opened.workspaceId,
+    workspaceRoot: opened.root,
+  });
+  assert.equal(waitCalled, false);
+  assert.notEqual(response.isError, true);
+  const structured = structuredContent(response);
+  const agent = structured.agent as Record<string, unknown>;
+  assert.equal(agent.id, record.id);
+  assert.equal(agent.status, "running");
+  assert.equal(agent.target, "codex-luna");
+  assert.equal(agent.provider, "codex");
+  assert.equal(agent.providerSessionId, "provider-session-get");
+  assert.equal(agent.latestResponse, "latest response");
+  assert.equal(structured.result, "Agent agt_get_running status: running.");
+  assert.equal(responseText(response), "Agent agt_get_running status: running.");
+});
+
+test("agent_get preserves terminal error records as successful observations", async (t) => {
+  const record = makeAgentRecord({
+    id: "agt_error",
+    status: "error",
+    error: "sandbox failed",
+    errorCode: "PROVIDER_INFRASTRUCTURE_ERROR",
+    errorRetryable: false,
+  });
+  const context = await fixture(t, {
+    localAgentProviders: [{ name: "codex", available: true }],
+    localAgentClient: makeLocalAgentMcpClient({
+      get: async () => Result.ok(record),
+    }),
+  });
+  const opened = structuredContent(await callOpen(context.client, context.project));
+
+  const response = await callAgentGet(context.client, {
+    workspaceId: opened.workspaceId,
+    agentId: record.id,
+  });
+
+  assert.notEqual(response.isError, true);
+  const structured = structuredContent(response);
+  const agent = structured.agent as Record<string, unknown>;
+  assert.equal(agent.status, "error");
+  assert.equal(agent.error, "sandbox failed");
+  assert.equal(agent.errorCode, "PROVIDER_INFRASTRUCTURE_ERROR");
+  assert.equal(agent.errorRetryable, false);
+  assert.equal(
+    responseText(response),
+    "Agent agt_error status: error (PROVIDER_INFRASTRUCTURE_ERROR).",
+  );
+});
+
+test("agent_get preserves LocalAgentClient errors", async (t) => {
+  const error = new AgentTargetError({
+    code: "AGENT_NOT_FOUND",
+    target: "agt_missing",
+    operation: "get",
+    retryable: false,
+    message: "Agent agt_missing was not found.",
+  });
+  const context = await fixture(t, {
+    localAgentProviders: [{ name: "codex", available: true }],
+    localAgentClient: makeLocalAgentMcpClient({
+      get: async () => Result.err(error),
+    }),
+  });
+  const opened = structuredContent(await callOpen(context.client, context.project));
+
+  const response = await callAgentGet(context.client, {
+    workspaceId: opened.workspaceId,
+    agentId: error.target,
+  });
+
+  assert.equal(response.isError, true);
+  assert.match(responseText(response), /AGENT_NOT_FOUND/);
+  assert.match(responseText(response), /Agent agt_missing was not found/);
+  const structured = structuredContent(response);
+  assert.equal(structured.errorCode, "AGENT_NOT_FOUND");
+  assert.equal(structured.error, error.message);
+  assert.equal(structured.errorRetryable, false);
+});
+
+test("agent_list forwards the workspace scope and preserves record order and fields", async (t) => {
+  let listScope: Parameters<LocalAgentMcpClient["list"]>[0] | undefined;
+  const records = [
+    makeAgentRecord({
+      id: "agt_running",
+      profileName: "codex-luna",
+      provider: "codex",
+      status: "running",
+      providerSessionId: "session-running",
+      latestResponse: "running response",
+    }),
+    makeAgentRecord({
+      id: "agt_idle",
+      profileName: "claude-reviewer",
+      provider: "claude",
+      status: "idle",
+      model: "model-idle",
+      effort: "low",
+    }),
+    makeAgentRecord({
+      id: "agt_stopped",
+      profileName: "pi-writer",
+      provider: "pi",
+      status: "stopped",
+      error: "stopped with details",
+      errorCode: "PROVIDER_CANCELLED",
+      errorRetryable: false,
+    }),
+  ];
+  const context = await fixture(t, {
+    localAgentProviders: [{ name: "codex", available: true }],
+    localAgentClient: makeLocalAgentMcpClient({
+      list: async (scope) => {
+        listScope = scope;
+        return Result.ok(records);
+      },
+    }),
+  });
+  const opened = structuredContent(await callOpen(context.client, context.project));
+
+  const response = await callAgentList(context.client, {
+    workspaceId: opened.workspaceId,
+  });
+
+  assert.deepEqual(listScope, {
+    workspaceId: opened.workspaceId,
+    workspaceRoot: opened.root,
+  });
+  assert.notEqual(response.isError, true);
+  const structured = structuredContent(response);
+  assert.equal(structured.count, 3);
+  const agents = structured.agents as Array<Record<string, unknown>>;
+  assert.equal(agents.length, 3);
+  assert.deepEqual(
+    agents.map((agent) => [agent.id, agent.status]),
+    [
+      ["agt_running", "running"],
+      ["agt_idle", "idle"],
+      ["agt_stopped", "stopped"],
+    ],
+  );
+  assert.equal(agents[0]?.target, "codex-luna");
+  assert.equal(agents[0]?.provider, "codex");
+  assert.equal(agents[0]?.providerSessionId, "session-running");
+  assert.equal(agents[0]?.latestResponse, "running response");
+  assert.equal(agents[2]?.error, "stopped with details");
+  assert.equal(agents[2]?.errorCode, "PROVIDER_CANCELLED");
+  assert.equal(agents[2]?.errorRetryable, false);
+  assert.equal(
+    responseText(response),
+    "Found 3 agents in this workspace: agt_running (running), agt_idle (idle), agt_stopped (stopped).",
+  );
+  assert.doesNotMatch(responseText(response), /session-running|running response|stopped with details/);
+});
+
+test("agent_list returns an explicit empty-workspace result", async (t) => {
+  const context = await fixture(t, {
+    localAgentProviders: [{ name: "codex", available: true }],
+    localAgentClient: makeLocalAgentMcpClient({
+      list: async () => Result.ok([]),
+    }),
+  });
+  const opened = structuredContent(await callOpen(context.client, context.project));
+
+  const response = await callAgentList(context.client, {
+    workspaceId: opened.workspaceId,
+  });
+
+  assert.notEqual(response.isError, true);
+  const structured = structuredContent(response);
+  assert.equal(structured.count, 0);
+  assert.deepEqual(structured.agents, []);
+  assert.equal(responseText(response), "No agents found in this workspace.");
+});
+
+test("agent_list preserves LocalAgentClient failures", async (t) => {
+  const error = new AgentDaemonUnavailableError({
+    code: "DAEMON_UNAVAILABLE",
+    operation: "agent.list",
+    retryable: true,
+    message: "The local agent daemon is unavailable.",
+  });
+  const context = await fixture(t, {
+    localAgentProviders: [{ name: "codex", available: true }],
+    localAgentClient: makeLocalAgentMcpClient({
+      list: async () => Result.err(error),
+    }),
+  });
+  const opened = structuredContent(await callOpen(context.client, context.project));
+
+  const response = await callAgentList(context.client, {
+    workspaceId: opened.workspaceId,
+  });
+
+  assert.equal(response.isError, true);
+  assert.match(responseText(response), /DAEMON_UNAVAILABLE/);
+  assert.match(responseText(response), /local agent daemon is unavailable/);
+  const structured = structuredContent(response);
+  assert.equal(structured.errorCode, "DAEMON_UNAVAILABLE");
+  assert.equal(structured.error, error.message);
+  assert.equal(structured.errorRetryable, true);
+});
+
+test("agent_list keeps all records while limiting its result summary to ten agents", async (t) => {
+  const records = Array.from({ length: 12 }, (_, index) => makeAgentRecord({
+    id: `agt_${String(index + 1).padStart(2, "0")}`,
+    status: index % 2 === 0 ? "running" : "idle",
+  }));
+  const context = await fixture(t, {
+    localAgentProviders: [{ name: "codex", available: true }],
+    localAgentClient: makeLocalAgentMcpClient({
+      list: async () => Result.ok(records),
+    }),
+  });
+  const opened = structuredContent(await callOpen(context.client, context.project));
+
+  const response = await callAgentList(context.client, {
+    workspaceId: opened.workspaceId,
+  });
+
+  const structured = structuredContent(response);
+  assert.equal(structured.count, 12);
+  assert.equal((structured.agents as unknown[]).length, 12);
+  assert.match(responseText(response), /agt_10 \(idle\)/);
+  assert.match(responseText(response), /2 more/);
+  assert.doesNotMatch(responseText(response), /agt_11|agt_12/);
+});
+
+test("agent_get and agent_list reject unknown workspaces before calling the client", async (t) => {
+  let getCalled = false;
+  let listCalled = false;
+  const record = makeAgentRecord({ id: "agt_unknown_workspace" });
+  const context = await fixture(t, {
+    localAgentProviders: [{ name: "codex", available: true }],
+    localAgentClient: makeLocalAgentMcpClient({
+      get: async () => {
+        getCalled = true;
+        return Result.ok(record);
+      },
+      list: async () => {
+        listCalled = true;
+        return Result.ok([record]);
+      },
+    }),
+  });
+
+  const getResponse = await callAgentGet(context.client, {
+    workspaceId: "ws_missing",
+    agentId: record.id,
+  });
+  const listResponse = await callAgentList(context.client, {
+    workspaceId: "ws_missing",
+  });
+
+  assert.equal(getResponse.isError, true);
+  assert.match(responseText(getResponse), /Unknown workspaceId: ws_missing/);
+  assert.equal(listResponse.isError, true);
+  assert.match(responseText(listResponse), /Unknown workspaceId: ws_missing/);
+  assert.equal(getCalled, false);
+  assert.equal(listCalled, false);
+});
+
 test("open_workspace keeps lifecycle flags out of model output and preserves complete card metadata", async (t) => {
   const providerNote = "available";
   const context = await fixture(t, {
@@ -969,6 +1294,26 @@ async function callAgentCancel(
   } as Parameters<Client["callTool"]>[0]);
 }
 
+async function callAgentGet(
+  client: Client,
+  input: Record<string, unknown>,
+): Promise<Awaited<ReturnType<Client["callTool"]>>> {
+  return client.callTool({
+    name: "agent_get",
+    arguments: input,
+  } as Parameters<Client["callTool"]>[0]);
+}
+
+async function callAgentList(
+  client: Client,
+  input: Record<string, unknown>,
+): Promise<Awaited<ReturnType<Client["callTool"]>>> {
+  return client.callTool({
+    name: "agent_list",
+    arguments: input,
+  } as Parameters<Client["callTool"]>[0]);
+}
+
 function makeLocalAgentMcpClient(
   overrides: Partial<LocalAgentMcpClient> = {},
 ): LocalAgentMcpClient {
@@ -978,6 +1323,8 @@ function makeLocalAgentMcpClient(
     wait: async () => Result.ok({ record, timedOut: false }),
     continue: async () => Result.ok(record),
     cancel: async () => Result.ok(record),
+    get: async () => Result.ok(record),
+    list: async () => Result.ok([record]),
     ...overrides,
   };
 }

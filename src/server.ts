@@ -120,6 +120,12 @@ const AGENT_WAIT_ANNOTATIONS = {
   idempotentHint: true,
   openWorldHint: false,
 };
+const AGENT_OBSERVATION_ANNOTATIONS = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+};
 
 interface RunningServer {
   app: ReturnType<typeof createMcpExpressApp>;
@@ -232,7 +238,7 @@ function serverInstructions(config: ServerConfig): string {
       ? " If the turn successfully modifies files by creating, editing, overwriting, deleting, moving, or applying patches, call show_changes exactly once for that workspace after the final related file change and before your final response so the user can inspect the aggregate diff for that turn. Do not call it after every individual file change; do not skip it because individual file-change tools already returned diffs."
       : "";
   const subagentInstruction = config.subagents.enabled
-    ? " When a suitable local coding agent is available and delegation is useful, use agent_start with the current workspaceId. agent_start returns immediately. Use agent_wait to wait for the current turn. Use agent_continue to start another turn on an existing agent after its previous turn is no longer active. Use agent_cancel when an active turn should be interrupted; cancellation is asynchronous, so use agent_wait afterward to observe the result. A wait timeout does not stop the agent."
+    ? " When a suitable local coding agent is available and delegation is useful, use agent_start with the current workspaceId. agent_start returns immediately. Use agent_wait to wait for the current turn. Use agent_continue to start another turn on an existing agent after its previous turn is no longer active. Use agent_cancel when an active turn should be interrupted; cancellation is asynchronous, so use agent_wait afterward to observe the result. A wait timeout does not stop the agent. Use agent_get for an immediate snapshot of one existing agent without waiting. Use agent_list to rediscover durable agents in the current workspace, especially after reconnecting or resuming work."
     : "";
 
   if (config.toolMode === "codex") {
@@ -290,7 +296,7 @@ function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
 
 export type LocalAgentMcpClient = Pick<
   LocalAgentClient,
-  "start" | "wait" | "continue" | "cancel"
+  "start" | "wait" | "continue" | "cancel" | "get" | "list"
 >;
 
 function agentOutputSchema(): z.ZodRawShape {
@@ -332,6 +338,19 @@ function agentCancelOutputSchema(): z.ZodRawShape {
   return resultOutputSchema({
     agent: z.object(agentOutputSchema()),
     cancelRequested: z.boolean(),
+  });
+}
+
+function agentGetOutputSchema(): z.ZodRawShape {
+  return resultOutputSchema({
+    agent: z.object(agentOutputSchema()),
+  });
+}
+
+function agentListOutputSchema(): z.ZodRawShape {
+  return resultOutputSchema({
+    agents: z.array(z.object(agentOutputSchema())),
+    count: z.number().int().nonnegative(),
   });
 }
 
@@ -1054,6 +1073,112 @@ function registerLocalAgentTools(
           agent,
           cancelRequested: true,
         },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "agent_get",
+    {
+      title: "Get agent",
+      description:
+        "Get the current state of one durable local coding agent in the current DevSpace workspace. This is an immediate snapshot and does not wait for a running turn to finish. Use agent_wait when waiting for the current turn is desired.",
+      inputSchema: {
+        workspaceId: z.string().describe(workspaceIdDescription),
+        agentId: z.string().min(1).describe("Durable agent identifier returned by agent_start."),
+      },
+      outputSchema: agentGetOutputSchema(),
+      _meta: {},
+      annotations: AGENT_OBSERVATION_ANNOTATIONS,
+    },
+    async ({ workspaceId, agentId }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const scope = {
+        workspaceId: workspace.id,
+        workspaceRoot: workspace.root,
+      };
+      const response = await client.get(agentId, scope);
+
+      if (response.isErr()) {
+        const errorResponse = agentErrorResponse(response.error);
+        logFailedToolResponse(config, {
+          tool: "agent_get",
+          workspaceId,
+        }, errorResponse.content, startedAt);
+        return errorResponse;
+      }
+
+      const agent = agentOutput(response.value);
+      const errorCode = agent.status === "error" && agent.errorCode
+        ? ` (${agent.errorCode})`
+        : "";
+      const result = `Agent ${agent.id} status: ${agent.status}${errorCode}.`;
+      const content = [textBlock(result)];
+      logToolCall(config, {
+        tool: "agent_get",
+        workspaceId,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        content,
+        structuredContent: { result, agent },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "agent_list",
+    {
+      title: "List agents",
+      description:
+        "List durable local coding agents associated with the current DevSpace workspace. This returns immediate state snapshots and does not wait for running turns. Use it to rediscover agent IDs after reconnecting or resuming work.",
+      inputSchema: {
+        workspaceId: z.string().describe(workspaceIdDescription),
+      },
+      outputSchema: agentListOutputSchema(),
+      _meta: {},
+      annotations: AGENT_OBSERVATION_ANNOTATIONS,
+    },
+    async ({ workspaceId }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const scope = {
+        workspaceId: workspace.id,
+        workspaceRoot: workspace.root,
+      };
+      const response = await client.list(scope);
+
+      if (response.isErr()) {
+        const errorResponse = agentErrorResponse(response.error);
+        logFailedToolResponse(config, {
+          tool: "agent_list",
+          workspaceId,
+        }, errorResponse.content, startedAt);
+        return errorResponse;
+      }
+
+      const agents = response.value.map(agentOutput);
+      const count = agents.length;
+      const result = count === 0
+        ? "No agents found in this workspace."
+        : `Found ${count} agent${count === 1 ? "" : "s"} in this workspace: ${agents
+            .slice(0, 10)
+            .map((agent) => `${agent.id} (${agent.status})`)
+            .join(", ")}${count > 10 ? `; ${count - 10} more` : ""}.`;
+      const content = [textBlock(result)];
+      logToolCall(config, {
+        tool: "agent_list",
+        workspaceId,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        content,
+        structuredContent: { result, agents, count },
       };
     },
   );
