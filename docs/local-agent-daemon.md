@@ -16,9 +16,11 @@ devspace agents run/continue/show/ls
           └── provider runtimes
 ```
 
-The CLI starts the daemon automatically when an agent command needs it. The
-MCP server can use the same local client when an MCP operation needs agent
-functionality, but `devspace serve` is not required for local-agent execution.
+On non-Windows systems, the CLI starts the daemon automatically when an agent
+command needs it. On Windows, `devspace serve` with subagents enabled reuses a
+valid interactive host or starts an owned persistent child for that foreground
+invocation; there is no login-autostart registration. The MCP server can use
+the same local client when an MCP operation needs agent functionality.
 The daemon is scoped to one DevSpace `stateDir`, so one SQLite store and one
 runtime owner serve all clients using that configuration.
 

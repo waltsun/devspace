@@ -345,6 +345,37 @@ try {
         return true;
       },
     );
+
+    writeFileSync(
+      join(configDir, "config.json"),
+      JSON.stringify({ publicBaseUrl: "https://existing.example" }),
+    );
+    const configCommandEnv = {
+      ...process.env,
+      DEVSPACE_CONFIG_DIR: configDir,
+    };
+    const configSet = await execFileAsync(
+      "node",
+      ["--import", "tsx", "src/cli.ts", "config", "set", "tunnel.provider", "cloudflared"],
+      { cwd: process.cwd(), encoding: "utf8", env: configCommandEnv },
+    );
+    assert.match(configSet.stdout, /Updated .*config\.json/);
+    assert.deepEqual(JSON.parse(readFileSync(join(configDir, "config.json"), "utf8")), {
+      publicBaseUrl: "https://existing.example",
+      tunnel: { provider: "cloudflared" },
+    });
+
+    await assert.rejects(
+      execFileAsync(
+        "node",
+        ["--import", "tsx", "src/cli.ts", "config", "set", "tunnel.provider", "invalid"],
+        { cwd: process.cwd(), encoding: "utf8", env: configCommandEnv },
+      ),
+      (error: unknown) => {
+        assert.match((error as { stderr?: string }).stderr ?? "", /Invalid tunnel\.provider/);
+        return true;
+      },
+    );
   } finally {
     await new Promise<void>((resolveClose, rejectClose) => {
       daemon.close((error) => error ? rejectClose(error) : resolveClose());

@@ -474,6 +474,15 @@ export function spawnLocalAgentDaemon(stateDir: string, env: NodeJS.ProcessEnv =
   child.unref();
 }
 
+export function spawnPersistentAgentHost(env: NodeJS.ProcessEnv = process.env): import("node:child_process").ChildProcess {
+  return spawn(process.execPath, [...daemonExecArgv(process.execArgv), resolveDaemonEntrypoint()], {
+    detached: false,
+    stdio: "inherit",
+    windowsHide: false,
+    env: { ...env, DEVSPACE_AGENTD_PERSISTENT: "1" },
+  });
+}
+
 export function daemonExecArgv(execArgv: readonly string[]): string[] {
   const result: string[] = [];
   for (let index = 0; index < execArgv.length; index += 1) {
@@ -571,11 +580,11 @@ async function sendRequest(
 function interactiveAgentHostUnavailableMessage(): string {
   return [
     "The DevSpace interactive agent host is not running.",
-    "Start it from an interactive Windows user session with:",
-    "devspace agent-host run",
+    "Start DevSpace from an interactive Windows user session with:",
+    "devspace serve",
     "",
-    "To start it automatically after login:",
-    "devspace agent-host install",
+    "The foreground serve command starts an owned host when subagents are enabled.",
+    "For diagnostics or manual startup, use: devspace agent-host run",
   ].join("\n");
 }
 

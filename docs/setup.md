@@ -8,12 +8,12 @@ This guide covers ChatGPT and Coding Agents using DevSpace with local projects.
 - npm
 - Git
 - Bash, including Git Bash or WSL on Windows
-- a public HTTPS URL that forwards to the local DevSpace server, only when
-  ChatGPT will connect
+- a public HTTPS URL that forwards to the local DevSpace server when using manual
+  tunnel mode and ChatGPT will connect
 
-DevSpace does not create the public tunnel for you. ChatGPT users can use
-Cloudflare Tunnel, ngrok, Pinggy, Tailscale Funnel, or their own HTTPS reverse
-proxy.
+DevSpace can start `cloudflared`, `ngrok`, or `localtunnel` for the duration of
+`devspace serve`. Manual mode supports Pinggy, Tailscale Funnel, or your own
+HTTPS reverse proxy.
 
 ## Install And Configure
 
@@ -70,18 +70,22 @@ These commands do not require `devspace serve`.
 
 ### Connect ChatGPT
 
-Setup only asks for a public URL if you selected ChatGPT. Start your tunnel or
-reverse proxy first and point it at:
+Setup only asks for a public URL if you selected ChatGPT and manual tunnel mode.
+For a managed provider, `devspace serve` starts the tunnel and discovers its URL.
+All providers forward to:
 
 ```text
 http://127.0.0.1:7676
 ```
 
-Enter the public origin without `/mcp`:
+In manual mode, enter the public origin without `/mcp`:
 
 ```text
 https://your-tunnel-host.example.com
 ```
+
+With a managed provider, skip the public URL prompt; `devspace serve` prints
+the discovered URL when it starts.
 
 Configure the MCP client with the full MCP endpoint:
 
@@ -99,7 +103,13 @@ Run:
 npx @waishnav/devspace serve
 ```
 
-If your tunnel URL changes for one run, override it without rewriting config:
+To select a managed provider without editing JSON:
+
+```bash
+npx @waishnav/devspace config set tunnel.provider cloudflared
+```
+
+If your manual tunnel URL changes for one run, override it without rewriting config:
 
 ```bash
 DEVSPACE_PUBLIC_BASE_URL="https://new-tunnel.example.com" npx @waishnav/devspace serve

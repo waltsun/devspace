@@ -7,9 +7,10 @@ CLI and MCP server use it as clients when they need agent execution.
 
 When subagents are enabled, the internal `devspace-agentd` process owns the
 durable agent manager and live provider runtimes. `devspace agents run` is a
-thin local client that starts or reuses the daemon automatically; `devspace
-serve` is not required. A run returns an agent id immediately, while the daemon
-persists its status, latest response, and provider session id.
+thin local client that starts or reuses the daemon automatically. `devspace serve`
+is not required on non-Windows systems; on Windows it can own the interactive
+host while it is running. A run returns an agent id immediately, while the
+daemon persists its status, latest response, and provider session id.
 
 Profiles are discovered from:
 

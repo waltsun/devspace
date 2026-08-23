@@ -3,7 +3,13 @@ import { join, resolve } from "node:path";
 import { expandHomePath } from "./roots.js";
 import type { LoggingConfig, LogFormat, LogLevel } from "./logger.js";
 import type { OAuthConfig } from "./oauth-provider.js";
-import { devspaceAgentsDir, devspaceSkillsDir, loadDevspaceFiles } from "./user-config.js";
+import {
+  devspaceAgentsDir,
+  devspaceSkillsDir,
+  loadDevspaceFiles,
+  TUNNEL_PROVIDERS,
+  type TunnelProvider,
+} from "./user-config.js";
 import { resolveSubagentsConfig, type SubagentsConfig } from "./local-agent-config.js";
 
 export type ToolMode = "minimal" | "full" | "codex";
@@ -11,6 +17,9 @@ export type WidgetMode = "off" | "changes" | "full";
 const DEFAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
 const DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const DEFAULT_ARTIFACT_MAX_FILE_BYTES = 100 * 1024 * 1024;
+export interface ResolvedTunnelConfig {
+  provider: TunnelProvider;
+}
 
 export interface ServerConfig {
   host: string;
@@ -19,6 +28,7 @@ export interface ServerConfig {
   allowedRoots: string[];
   allowedHosts: string[];
   publicBaseUrl: string;
+  tunnel: ResolvedTunnelConfig;
   toolMode: ToolMode;
   widgets: WidgetMode;
   stateDir: string;
@@ -196,6 +206,20 @@ function parseOAuthConfig(env: NodeJS.ProcessEnv, ownerToken: string | undefined
   };
 }
 
+function parseTunnelConfig(value: unknown): ResolvedTunnelConfig {
+  if (value === undefined) return { provider: "manual" };
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Invalid tunnel config: expected an object.");
+  }
+
+  const provider = (value as { provider?: unknown }).provider;
+  if (provider === undefined) return { provider: "manual" };
+  if (typeof provider !== "string" || !TUNNEL_PROVIDERS.includes(provider as TunnelProvider)) {
+    throw new Error(`Invalid tunnel.provider: ${String(provider)}`);
+  }
+  return { provider: provider as TunnelProvider };
+}
+
 function defaultStateDir(): string {
   return join(homedir(), ".local", "share", "devspace");
 }
@@ -215,6 +239,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   const publicBaseUrl = parsePublicBaseUrl(
     env.DEVSPACE_PUBLIC_BASE_URL ?? files.config.publicBaseUrl ?? localPublicBaseUrl(host, port),
   );
+  const tunnel = parseTunnelConfig(files.config.tunnel);
   const derivedAllowedHosts = [
     "localhost",
     "127.0.0.1",
@@ -231,6 +256,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     allowedRoots: parseAllowedRoots(env.DEVSPACE_ALLOWED_ROOTS ?? files.config.allowedRoots),
     allowedHosts: parseAllowedHosts(env.DEVSPACE_ALLOWED_HOSTS, derivedAllowedHosts),
     publicBaseUrl,
+    tunnel,
     toolMode: parseToolMode(env),
     widgets: parseWidgetMode(env.DEVSPACE_WIDGETS),
     stateDir: resolve(expandHomePath(env.DEVSPACE_STATE_DIR ?? files.config.stateDir ?? defaultStateDir())),

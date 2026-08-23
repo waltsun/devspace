@@ -24,6 +24,7 @@ npx @waishnav/devspace serve
 npx @waishnav/devspace doctor
 npx @waishnav/devspace config get
 npx @waishnav/devspace config set publicBaseUrl https://devspace.example.com
+npx @waishnav/devspace config set tunnel.provider cloudflared
 ```
 
 ## Core Environment Variables
@@ -38,6 +39,26 @@ npx @waishnav/devspace config set publicBaseUrl https://devspace.example.com
 | `DEVSPACE_OAUTH_OWNER_TOKEN` | Owner password for OAuth approval. Must be at least 16 characters. |
 | `DEVSPACE_WORKTREE_ROOT` | Directory for managed Git worktrees. Defaults to `~/.devspace/worktrees`. |
 | `DEVSPACE_STATE_DIR` | Directory for SQLite state. Defaults to `~/.local/share/devspace`. |
+
+## Tunnel Provider
+
+The persisted `tunnel.provider` defaults to `manual`. Managed providers are
+started by the foreground `devspace serve` process and their discovered HTTPS
+URL is used for `publicBaseUrl` and allowed-host derivation before the server
+starts.
+
+Supported values:
+
+- `manual` — do not start a tunnel child; use `publicBaseUrl` or an environment override.
+- `cloudflared`
+- `ngrok`
+- `localtunnel`
+
+Select one with:
+
+```bash
+npx @waishnav/devspace config set tunnel.provider cloudflared
+```
 
 ## Native Artifact Download
 

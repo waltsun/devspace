@@ -69,7 +69,15 @@ npx @waishnav/devspace config set publicBaseUrl https://your-tunnel-host.example
 
 Temporary tunnels often change URLs between runs.
 
-For a one-off run:
+For managed tunnels, select the provider once and let `devspace serve` discover
+the URL on each run:
+
+```bash
+npx @waishnav/devspace config set tunnel.provider cloudflared
+npx @waishnav/devspace serve
+```
+
+For a manual tunnel, use a one-off URL override:
 
 ```bash
 DEVSPACE_PUBLIC_BASE_URL="https://new-tunnel.example.com" npx @waishnav/devspace serve
@@ -91,8 +99,9 @@ Run:
 npx @waishnav/devspace doctor
 ```
 
-Confirm the public URL hostname appears in allowed hosts. If you changed tunnel
-URLs, update `publicBaseUrl`.
+Confirm the public URL hostname appears in allowed hosts. With a managed tunnel,
+`devspace serve` derives it from the discovered URL; with a manual tunnel, update
+`publicBaseUrl` when the URL changes.
 
 Use this only for intentional local debugging:
 

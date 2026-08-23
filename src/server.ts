@@ -127,7 +127,7 @@ const AGENT_OBSERVATION_ANNOTATIONS = {
   openWorldHint: false,
 };
 
-interface RunningServer {
+export interface RunningServer {
   app: ReturnType<typeof createMcpExpressApp>;
   config: ServerConfig;
   localAgentProviders: LocalAgentProviderStatus[];

@@ -67,7 +67,9 @@ URL. Use `DEVSPACE_ALLOWED_HOSTS=*` only for intentional local debugging.
 
 ## Tunnels
 
-DevSpace does not manage tunnels. Your tunnel or reverse proxy should point to:
+Manual tunnels and reverse proxies remain user-owned. If a managed provider is
+configured, `devspace serve` starts its child for the foreground process and
+stops it during shutdown. The tunnel should point to:
 
 ```text
 http://127.0.0.1:7676

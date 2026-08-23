@@ -43,7 +43,9 @@ Filesystem tools enforce approved-root containment. Shell commands run with the 
 
 Resolve and validate paths before destructive actions. Do not broaden an allowed root, delete application state, expose a credential, or replace an existing process as a convenient fix.
 
-Keep tunnel ownership and credentials with the user. DevSpace may operate through a user-controlled tunnel, but it does not own tunnel lifecycle or configuration.
+Keep tunnel credentials with the user. Manual tunnels and reverse proxies remain
+user-owned; when a managed tunnel provider is configured, `devspace serve` owns
+that child only for the foreground invocation and stops it during shutdown.
 
 ## Diagnose the correct layer
 

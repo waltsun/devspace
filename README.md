@@ -84,10 +84,11 @@ During setup, DevSpace asks for:
 - which Coding Agents DevSpace may use
 
 If you select ChatGPT, setup also asks which local project folders it may open
-and for your public HTTPS base URL from Cloudflare Tunnel, ngrok, Pinggy,
-Tailscale Funnel, or another reverse proxy. A Coding Agents-only setup asks
-neither question: local commands use the current Git project, or the current
-directory outside a repository.
+and how to provide a public HTTPS URL. Choose a managed provider (`cloudflared`,
+`ngrok`, or `localtunnel`) and `devspace serve` starts it automatically, or
+choose manual mode and provide the URL from your own tunnel or reverse proxy.
+A Coding Agents-only setup asks neither question: local commands use the
+current Git project, or the current directory outside a repository.
 
 Use the public origin without `/mcp` during setup:
 
@@ -95,8 +96,9 @@ Use the public origin without `/mcp` during setup:
 https://your-tunnel-host.example.com
 ```
 
-You will configure your MCP client with the public `/mcp` URL after setup.
-Run `devspace serve` when using ChatGPT. For Coding Agents, setup prints a
+You will configure your MCP client with the public `/mcp` URL after setup. With
+a managed provider, use the URL printed by `devspace serve`; with manual mode,
+use the URL saved during setup. Run `devspace serve` when using ChatGPT. For Coding Agents, setup prints a
 `skills` command and lets the Skills CLI handle installation.
 
 When the client connects, DevSpace opens an Owner password approval page. Enter
@@ -156,8 +158,8 @@ connected client like a trusted coding partner with access to your machine.
 
 For a normal ChatGPT coding session:
 
-1. Start your tunnel.
-2. Run `devspace serve`.
+1. Configure a managed tunnel provider, or keep manual mode with a public URL.
+2. Run `devspace serve`; it starts the managed tunnel before the MCP server.
 3. Connect the MCP client to your public `/mcp` URL.
 4. Approve the connection with the Owner password.
 5. Ask ChatGPT to open a project inside one of your allowed roots.

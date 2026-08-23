@@ -55,6 +55,16 @@ assert.throws(
   /Invalid DEVSPACE_TOOL_MODE: invalid/,
 );
 
+const invalidTunnelConfigDir = mkdtempSync(join(tmpdir(), "devspace-invalid-tunnel-config-test-"));
+writeFileSync(
+  join(invalidTunnelConfigDir, "config.json"),
+  JSON.stringify({ tunnel: { provider: "none" } }),
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_CONFIG_DIR: invalidTunnelConfigDir }),
+  /Invalid tunnel\.provider: none/,
+);
+
 assert.deepEqual(loadConfig(baseEnv).logging, {
   level: "info",
   format: "json",
@@ -138,6 +148,7 @@ assert.throws(
 );
 
 assert.equal(loadConfig(baseEnv).publicBaseUrl, "http://127.0.0.1:7676");
+assert.deepEqual(loadConfig(baseEnv).tunnel, { provider: "manual" });
 assert.deepEqual(loadConfig(baseEnv).allowedHosts, ["localhost", "127.0.0.1", "::1"]);
 
 assert.equal(
@@ -160,6 +171,7 @@ writeFileSync(
     port: 8787,
     allowedRoots: [process.cwd()],
     publicBaseUrl: "https://devspace.example.com",
+    tunnel: { provider: "cloudflared" },
     subagents: true,
     artifactsEnabled: true,
     artifactMaxFileBytes: 321,
@@ -176,6 +188,7 @@ const fileConfig = loadConfig({ DEVSPACE_CONFIG_DIR: configDir });
 assert.equal(fileConfig.port, 8787);
 assert.equal(fileConfig.oauth.ownerToken, "persisted-owner-token-long-enough");
 assert.equal(fileConfig.publicBaseUrl, "https://devspace.example.com");
+assert.deepEqual(fileConfig.tunnel, { provider: "cloudflared" });
 assert.equal(fileConfig.subagents.enabled, true);
 assert.equal(fileConfig.subagents.providers.length, 7);
 assert.equal(fileConfig.artifactsEnabled, true);

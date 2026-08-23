@@ -10,11 +10,28 @@ import { join, resolve } from "node:path";
 import { expandHomePath } from "./roots.js";
 import type { StoredSubagentsConfig } from "./local-agent-config.js";
 
+export type TunnelProvider = "manual" | "ngrok" | "cloudflared" | "localtunnel";
+export const TUNNEL_PROVIDERS: readonly TunnelProvider[] = [
+  "manual",
+  "ngrok",
+  "cloudflared",
+  "localtunnel",
+];
+
+export function isTunnelProvider(value: string): value is TunnelProvider {
+  return TUNNEL_PROVIDERS.includes(value as TunnelProvider);
+}
+
+export interface DevspaceTunnelConfig {
+  provider?: TunnelProvider;
+}
+
 export interface DevspaceUserConfig {
   host?: string;
   port?: number;
   allowedRoots?: string[];
   publicBaseUrl?: string | null;
+  tunnel?: DevspaceTunnelConfig;
   allowedHosts?: string[];
   stateDir?: string;
   worktreeRoot?: string;

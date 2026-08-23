@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 import { createRequire } from "node:module";
-import { spawn } from "node:child_process";
+import type { Server as HttpServer } from "node:http";
 import { stdin as input, stdout as output } from "node:process";
 import { resolve } from "node:path";
 import type { Result as BetterResult } from "better-result";
 import * as prompts from "@clack/prompts";
+import type { Express } from "express";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
 import { satisfies } from "semver";
 import { loadConfig } from "./config.js";
@@ -24,7 +25,10 @@ import {
   parseLocalAgentContinueArgs,
   parseLocalAgentRunArgs,
 } from "./local-agent-targets.js";
-import { createLocalAgentClient, daemonExecArgv, resolveDaemonEntrypoint } from "./local-agent-client.js";
+import {
+  createLocalAgentClient,
+  spawnPersistentAgentHost,
+} from "./local-agent-client.js";
 import { toAgentErrorPayload, type LocalAgentError } from "./local-agent-errors.js";
 import {
   formatAgentObservation,
@@ -49,12 +53,15 @@ import {
   loadDevspaceFiles,
   writeDevspaceAuth,
   writeDevspaceConfig,
+  isTunnelProvider,
+  type TunnelProvider,
   type DevspaceUserConfig,
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
 import { assertInteractiveWindowsSession, getCurrentWindowsSessionId } from "./windows-session.js";
-import { installWindowsAgentHost, uninstallWindowsAgentHost } from "./windows-agent-host.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
+import { prepareServe, type PreparedServe } from "./serve-launcher.js";
+import type { RunningServer } from "./server.js";
 
 type Command = "serve" | "init" | "doctor" | "config" | "agents" | "agent-host" | "help" | "version";
 const require = createRequire(import.meta.url);
@@ -84,10 +91,10 @@ async function main(argv: string[]): Promise<void> {
       await runAgentsCommand(args);
       return;
     case "help":
+      printHelp();
+      return;
     case "agent-host":
       await runAgentHostCommand(args);
-      return;
-      printHelp();
       return;
     case "version":
       printVersion();
@@ -149,7 +156,10 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
           hint: "Use DevSpace from Codex, Claude Code, OpenCode, Pi, and similar tools.",
         },
       ],
-      initialValues: files.config.publicBaseUrl ? ["chatgpt"] : ["coding-agents"],
+      initialValues: files.config.publicBaseUrl || files.config.tunnel?.provider !== undefined
+        && files.config.tunnel.provider !== "manual"
+        ? ["chatgpt"]
+        : ["coding-agents"],
       required: true,
     });
     if (prompts.isCancel(destinationAnswer)) throw new SetupCancelledError();
@@ -175,24 +185,62 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
     const port = isValidPort(files.config.port) ? files.config.port : 7676;
 
     let publicBaseUrl: string | null = null;
+    let tunnelProvider: TunnelProvider = files.config.tunnel?.provider ?? "manual";
     if (useChatGpt) {
-      prompts.note(
-        [
-          `Point your HTTPS tunnel or reverse proxy to http://127.0.0.1:${port}.`,
-          "Paste its public URL below.",
-          "",
-          "Example: https://your-tunnel-host.example.com",
-        ].join("\n"),
-        "Connect ChatGPT",
-      );
-      publicBaseUrl = normalizePublicBaseUrl(await textPrompt({
-        message: files.config.publicBaseUrl
-          ? `What public URL will ChatGPT connect to? Press Enter to keep ${files.config.publicBaseUrl}`
-          : "What public URL will ChatGPT connect to?",
-        placeholder: files.config.publicBaseUrl ?? "https://your-tunnel-host.example.com",
-        defaultValue: files.config.publicBaseUrl ?? "",
-        validate: validateRequiredPublicBaseUrl,
-      }));
+      const tunnelAnswer = await prompts.select({
+        message: "How should DevSpace provide ChatGPT with a public HTTPS URL?",
+        options: [
+          {
+            value: "manual",
+            label: "Manual or existing reverse proxy",
+            hint: "Use the publicBaseUrl you provide",
+          },
+          {
+            value: "cloudflared",
+            label: "Cloudflare Quick Tunnel",
+            hint: "devspace serve starts cloudflared",
+          },
+          {
+            value: "ngrok",
+            label: "ngrok",
+            hint: "devspace serve starts ngrok",
+          },
+          {
+            value: "localtunnel",
+            label: "localtunnel",
+            hint: "devspace serve starts localtunnel through npx",
+          },
+        ],
+        initialValue: tunnelProvider,
+      });
+      if (prompts.isCancel(tunnelAnswer)) throw new SetupCancelledError();
+      tunnelProvider = tunnelAnswer as TunnelProvider;
+
+      if (tunnelProvider === "manual") {
+        prompts.note(
+          [
+            `Point your HTTPS tunnel or reverse proxy to http://127.0.0.1:${port}.`,
+            "Paste its public URL below.",
+            "",
+            "Example: https://your-tunnel-host.example.com",
+          ].join("\n"),
+          "Connect ChatGPT",
+        );
+        publicBaseUrl = normalizePublicBaseUrl(await textPrompt({
+          message: files.config.publicBaseUrl
+            ? `What public URL will ChatGPT connect to? Press Enter to keep ${files.config.publicBaseUrl}`
+            : "What public URL will ChatGPT connect to?",
+          placeholder: files.config.publicBaseUrl ?? "https://your-tunnel-host.example.com",
+          defaultValue: files.config.publicBaseUrl ?? "",
+          validate: validateRequiredPublicBaseUrl,
+        }));
+      } else {
+        publicBaseUrl = files.config.publicBaseUrl ?? null;
+        prompts.note(
+          `devspace serve will start the configured ${tunnelProvider} tunnel for http://127.0.0.1:${port} and discover the public URL automatically.`,
+          "Connect ChatGPT",
+        );
+      }
     }
 
     const currentSubagents = resolveSubagentsConfig(files.config.subagents, {});
@@ -230,6 +278,7 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
       port,
       ...(allowedRoots ? { allowedRoots } : {}),
       publicBaseUrl,
+      ...(useChatGpt ? { tunnel: { ...files.config.tunnel, provider: tunnelProvider } } : {}),
       subagents,
     };
     const auth = {
@@ -265,7 +314,7 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
       );
     }
     const nextSteps = [
-      useChatGpt ? "Run `devspace serve`, then connect ChatGPT." : undefined,
+      useChatGpt ? "Run `devspace serve`; it starts the configured tunnel before the MCP server, then connect ChatGPT." : undefined,
       useCodingAgents ? "Run the skill command above before delegating from your Coding Agents." : undefined,
     ].filter(Boolean).join(" ");
     prompts.outro(nextSteps);
@@ -292,37 +341,139 @@ async function serve(): Promise<void> {
     );
   }
 
-  const { createServer } = await import("./server.js");
-  const config = loadConfig();
-  const { app, close, localAgentProviders } = createServer(config);
-  const httpServer = app.listen(config.port, config.host, () => {
-    console.log(`devspace listening on http://${config.host}:${config.port}/mcp`);
-    console.log(`public base url: ${config.publicBaseUrl}`);
-    console.log(`allowed roots: ${config.allowedRoots.join(", ")}`);
-    console.log(`allowed hosts: ${config.allowedHosts.join(", ")}`);
-    if (config.allowedHosts.includes("*")) {
-      console.warn("warning: Host header allowlist is disabled because DEVSPACE_ALLOWED_HOSTS=*");
-    }
-    console.log("auth: Owner password approval required");
-    console.log(`logging: ${config.logging.level} ${config.logging.format}`);
-    console.log(`subagent providers: ${formatLocalAgentProviderStatusSummary(localAgentProviders)}`);
-  });
-
+  let prepared: PreparedServe | undefined;
+  let application: RunningServer | undefined;
+  let httpServer: HttpServer | undefined;
   let shuttingDown = false;
-  const shutdown = async () => {
+  let startupSignalReceived = false;
+  const recordStartupSignal = () => {
+    startupSignalReceived = true;
+  };
+  process.once("SIGINT", recordStartupSignal);
+  process.once("SIGTERM", recordStartupSignal);
+  try {
+    prepared = await prepareServe();
+    const { createServer } = await import("./server.js");
+    application = createServer(prepared.config);
+    httpServer = await listenHttpServer(application.app, prepared.config, () => {
+      console.log(`devspace listening on http://${prepared!.config.host}:${prepared!.config.port}/mcp`);
+      console.log(`public base url: ${prepared!.config.publicBaseUrl}`);
+      console.log(`allowed roots: ${prepared!.config.allowedRoots.join(", ")}`);
+      console.log(`allowed hosts: ${prepared!.config.allowedHosts.join(", ")}`);
+      if (prepared!.config.allowedHosts.includes("*")) {
+        console.warn("warning: Host header allowlist is disabled because DEVSPACE_ALLOWED_HOSTS=*");
+      }
+      console.log("auth: Owner password approval required");
+      console.log(`logging: ${prepared!.config.logging.level} ${prepared!.config.logging.format}`);
+      console.log(`subagent providers: ${formatLocalAgentProviderStatusSummary(application!.localAgentProviders)}`);
+    });
+  } catch (error) {
+    process.off("SIGINT", recordStartupSignal);
+    process.off("SIGTERM", recordStartupSignal);
+    await closeServeStartup(application, httpServer, prepared);
+    throw error;
+  }
+
+  const shutdown = async (exitCode: number, failure?: unknown) => {
     if (shuttingDown) return;
     shuttingDown = true;
-    await shutdownHttpServer(httpServer, close);
-    process.exit(0);
+    let shutdownError: unknown;
+    try {
+      if (httpServer && application) await shutdownHttpServer(httpServer, application.close);
+      else await application?.close();
+    } catch (error) {
+      shutdownError = error;
+    }
+    try {
+      await prepared?.closeChildren();
+    } catch (error) {
+      shutdownError ??= error;
+    }
+    if (failure) {
+      console.error(`devspace serve stopped because a managed child failed: ${errorMessage(failure)}`);
+    }
+    if (shutdownError) {
+      console.error(`devspace shutdown failed: ${errorMessage(shutdownError)}`);
+      exitCode = 1;
+    }
+    process.exit(exitCode);
   };
   const handleShutdown = () => {
-    void shutdown().catch((error) => {
+    void shutdown(0).catch((error) => {
       console.error("devspace shutdown failed", error);
       process.exit(1);
     });
   };
+  const handleManagedChildExit = (kind: string) => (error: Error) => {
+    void shutdown(1, new Error(`${kind}: ${error.message}`, { cause: error })).catch((shutdownError) => {
+      console.error("devspace shutdown failed", shutdownError);
+      process.exit(1);
+    });
+  };
+  prepared.tunnel?.onExit(handleManagedChildExit("Configured tunnel"));
+  prepared.agentHost?.onExit(handleManagedChildExit("Owned Windows agent host"));
   process.once("SIGINT", handleShutdown);
   process.once("SIGTERM", handleShutdown);
+  process.off("SIGINT", recordStartupSignal);
+  process.off("SIGTERM", recordStartupSignal);
+  if (startupSignalReceived) {
+    void shutdown(0).catch((error) => {
+      console.error("devspace shutdown failed", error);
+      process.exit(1);
+    });
+  }
+}
+
+async function closeServeStartup(
+  application: { close(): Promise<void> } | undefined,
+  httpServer: HttpServer | undefined,
+  prepared: PreparedServe | undefined,
+): Promise<void> {
+  const errors: unknown[] = [];
+  try {
+    if (httpServer && application) await shutdownHttpServer(httpServer, application.close);
+    else await application?.close();
+  } catch (error) {
+    errors.push(error);
+  }
+  try {
+    await prepared?.closeChildren();
+  } catch (error) {
+    errors.push(error);
+  }
+  if (errors.length > 0) {
+    console.error(`devspace startup cleanup failed: ${errors.map(errorMessage).join("; ")}`);
+  }
+}
+
+function listenHttpServer(
+  app: Express,
+  config: { port: number; host: string },
+  onListening: () => void,
+): Promise<HttpServer> {
+  return new Promise<HttpServer>((resolve, reject) => {
+    let httpServer: HttpServer;
+    const onError = (error: Error) => {
+      httpServer?.off("error", onError);
+      httpServer?.close(() => undefined);
+      reject(error);
+    };
+    try {
+      httpServer = app.listen(config.port, config.host, () => {
+        httpServer.off("error", onError);
+        try {
+          onListening();
+          resolve(httpServer);
+        } catch (error) {
+          httpServer.close(() => undefined);
+          reject(error);
+        }
+      });
+      httpServer.once("error", onError);
+    } catch (error) {
+      reject(error);
+    }
+  });
 }
 
 async function runDoctor(): Promise<void> {
@@ -366,19 +517,31 @@ function runConfigCommand(args: string[]): void {
   if (subcommand !== "set") {
     throw new Error(`Unknown config command: ${subcommand}`);
   }
-  if (key !== "publicBaseUrl") {
-    throw new Error("Only `devspace config set publicBaseUrl <url|null>` is supported right now.");
-  }
-
   const value = rest.join(" ").trim();
   if (!value) {
-    throw new Error("Missing publicBaseUrl value.");
+    throw new Error(`Missing ${key ?? "config"} value.`);
   }
 
-  writeDevspaceConfig({
-    ...files.config,
-    publicBaseUrl: normalizeOptionalPublicBaseUrl(value),
-  });
+  if (key === "publicBaseUrl") {
+    writeDevspaceConfig({
+      ...files.config,
+      publicBaseUrl: normalizeOptionalPublicBaseUrl(value),
+    });
+  } else if (key === "tunnel.provider") {
+    if (!isTunnelProvider(value)) {
+      throw new Error(
+        "Invalid tunnel.provider. Choose manual, ngrok, cloudflared, or localtunnel.",
+      );
+    }
+    writeDevspaceConfig({
+      ...files.config,
+      tunnel: { ...files.config.tunnel, provider: value },
+    });
+  } else {
+    throw new Error(
+      "Only `devspace config set publicBaseUrl <url|null>` and `devspace config set tunnel.provider <provider>` are supported.",
+    );
+  }
   console.log(`Updated ${files.configPath}`);
 }
 
@@ -394,6 +557,7 @@ function printHelp(): void {
       "  devspace doctor          Show config, runtime, and native dependency status",
       "  devspace config get      Print persisted config",
       "  devspace config set publicBaseUrl <url|null>",
+      "  devspace config set tunnel.provider <manual|ngrok|cloudflared|localtunnel>",
       "  devspace agents ls       List subagent sessions",
       "  devspace agents run <profile-or-provider> [--model <model>] [--effort <level>] <prompt>",
       "  devspace agents continue <id> [--model <model>] [--effort <level>] <prompt>",
@@ -401,10 +565,10 @@ function printHelp(): void {
       "  devspace agents show <id>",
       "  devspace agents daemon <status|stop|logs>",
       "  devspace -v, --version   Print the installed version",
-      "  devspace agent-host <run|install|status|uninstall>",
+      "  devspace agent-host <run|status>",
       "",
-      "For temporary tunnels:",
-      "  DEVSPACE_PUBLIC_BASE_URL=https://example.trycloudflare.com devspace serve",
+      "`devspace serve` starts the configured tunnel before the MCP server.",
+      "Use `devspace config set tunnel.provider <provider>` to select one.",
     ].join("\n"),
   );
 }
@@ -412,23 +576,13 @@ function printHelp(): void {
 // agent-host commands
 async function runAgentHostCommand(args: string[]): Promise<void> {
   const [subcommand, ...extra] = args;
-  if (extra.length > 0) throw new Error("Usage: devspace agent-host <run|install|status|uninstall>");
+  if (extra.length > 0) throw new Error("Usage: devspace agent-host <run|status>");
   switch (subcommand) {
     case "run":
       await runAgentHostRun();
       return;
-    case "install":
-      installWindowsAgentHost();
-      console.log("DevSpace agent host will start automatically at the next Windows login.");
-      console.log("To start it now, run:");
-      console.log("devspace agent-host run");
-      return;
     case "status":
       await runAgentHostStatus();
-      return;
-    case "uninstall":
-      uninstallWindowsAgentHost();
-      console.log("DevSpace agent host login startup removed.");
       return;
     case undefined:
     case "help":
@@ -437,7 +591,7 @@ async function runAgentHostCommand(args: string[]): Promise<void> {
       printAgentHostHelp();
       return;
     default:
-      throw new Error("Usage: devspace agent-host <run|install|status|uninstall>");
+      throw new Error("Usage: devspace agent-host <run|status>");
   }
 }
 
@@ -448,16 +602,7 @@ async function runAgentHostRun(): Promise<void> {
   }
 
   await new Promise<void>((resolve, reject) => {
-    const child = spawn(
-      process.execPath,
-      [...daemonExecArgv(process.execArgv), resolveDaemonEntrypoint()],
-      {
-        detached: false,
-        stdio: "inherit",
-        windowsHide: false,
-        env: { ...process.env, DEVSPACE_AGENTD_PERSISTENT: "1" },
-      },
-    );
+    const child = spawnPersistentAgentHost();
     child.once("error", reject);
     child.once("exit", (code, signal) => {
       if (code === 0) {
@@ -497,9 +642,7 @@ function printAgentHostHelp(): void {
     "",
     "Usage:",
     "  devspace agent-host run",
-    "  devspace agent-host install",
     "  devspace agent-host status",
-    "  devspace agent-host uninstall",
   ].join("\n"));
 }
 async function runAgentsCommand(args: string[]): Promise<void> {
@@ -862,6 +1005,10 @@ function checkBashShell(): string {
     const message = error instanceof Error ? error.message : String(error);
     return `unavailable (${message})`;
   }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 main(process.argv.slice(2)).catch((error) => {
