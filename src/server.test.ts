@@ -96,6 +96,59 @@ test("agent controller tools are exposed only when subagents are enabled", async
   assert.deepEqual(listTool._meta, {});
 });
 
+test("process tools expose waitMs and honor bounded MCP wait windows", async (t) => {
+  const context = await fixture(t, { toolMode: "codex" });
+  const tools = (await context.client.listTools()).tools;
+  for (const toolName of ["exec_command", "write_stdin"]) {
+    const tool = tools.find((candidate) => candidate.name === toolName);
+    assert.ok(tool, `${toolName} should be exposed`);
+    const properties = (tool.inputSchema as { properties?: Record<string, unknown> }).properties;
+    assert.ok(properties?.waitMs, `${toolName} should expose waitMs`);
+    assert.equal(properties && "yieldTimeMs" in properties, false);
+    assert.equal(properties && "yieldTimeMs" in properties, false);
+  }
+
+  const opened = structuredContent(await callOpen(context.client, context.project));
+  const workspaceId = opened.workspaceId as string;
+  const startedAt = performance.now();
+  const started = await context.client.callTool({
+    name: "exec_command",
+    arguments: {
+      workspaceId,
+      cmd: "node -e \"setTimeout(() => {}, 2000)\"",
+      waitMs: 1,
+    },
+  } as Parameters<Client["callTool"]>[0]);
+  const startElapsedMs = performance.now() - startedAt;
+  const startOutput = structuredContent(started);
+  assert.equal(startOutput.running, true);
+  assert.equal(typeof startOutput.sessionId, "number");
+  assert.ok(startElapsedMs < 1_000, `exec_command waitMs was ignored (${startElapsedMs} ms)`);
+
+  const polledAt = performance.now();
+  const polled = await context.client.callTool({
+    name: "write_stdin",
+    arguments: {
+      workspaceId,
+      sessionId: startOutput.sessionId,
+      waitMs: 1,
+    },
+  } as Parameters<Client["callTool"]>[0]);
+  const pollElapsedMs = performance.now() - polledAt;
+  assert.equal(structuredContent(polled).running, true);
+  assert.ok(pollElapsedMs < 1_000, `write_stdin waitMs was ignored (${pollElapsedMs} ms)`);
+
+  await context.client.callTool({
+    name: "write_stdin",
+    arguments: {
+      workspaceId,
+      sessionId: startOutput.sessionId,
+      chars: "\u0003",
+      waitMs: 1_000,
+    },
+  } as Parameters<Client["callTool"]>[0]);
+});
+
 test("agent_start resolves the workspace and returns without waiting", async (t) => {
   let startInput: Parameters<LocalAgentMcpClient["start"]>[0] | undefined;
   let waitCalled = false;
@@ -1130,6 +1183,7 @@ async function fixture(
   t: TestContext,
   options: {
     git?: boolean;
+    toolMode?: "minimal" | "full" | "codex";
     localAgentProviders?: LocalAgentProviderAvailability[] | (() => LocalAgentProviderAvailability[]);
     subagents?: SubagentsConfig;
     localAgentClient?: LocalAgentMcpClient;
@@ -1171,7 +1225,7 @@ async function fixture(
     DEVSPACE_WORKTREE_ROOT: join(root, ".worktrees"),
     DEVSPACE_AGENT_DIR: agentDir,
     DEVSPACE_WIDGETS: "full",
-    DEVSPACE_TOOL_MODE: "full",
+    DEVSPACE_TOOL_MODE: options.toolMode ?? "full",
     DEVSPACE_SUBAGENTS: options.localAgentProviders ? "1" : "0",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",

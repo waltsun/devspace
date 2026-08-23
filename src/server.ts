@@ -701,7 +701,7 @@ function registerCodexProcessTools(
     {
       title: "Execute command",
       description:
-        "Run a command in a workspace. Returns its result when it exits during the yield window, otherwise returns a sessionId for write_stdin. Use this for file inspection, tests, builds, package scripts, and long-running processes.",
+        "Run a command in a workspace. Returns its result when it exits during the wait window, otherwise returns a sessionId for write_stdin. Use this for file inspection, tests, builds, package scripts, and long-running processes.",
       inputSchema: {
         workspaceId: z.string().describe(workspaceIdDescription),
         cmd: z.string().min(1).describe("Shell command to execute."),
@@ -715,7 +715,7 @@ function registerCodexProcessTools(
           .string()
           .optional()
           .describe("Working directory relative to the workspace root. Defaults to the workspace root."),
-        yieldTimeMs: z
+        waitMs: z
           .number()
           .int()
           .min(0)
@@ -734,7 +734,7 @@ function registerCodexProcessTools(
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, cmd, tty, columns, rows, workingDirectory, yieldTimeMs, maxOutputTokens }) => {
+    async ({ workspaceId, cmd, tty, columns, rows, workingDirectory, waitMs, maxOutputTokens }) => {
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
       const cwd = workspaces.resolveWorkingDirectory(workspace, workingDirectory);
@@ -746,7 +746,7 @@ function registerCodexProcessTools(
         tty,
         columns,
         rows,
-        yieldTimeMs,
+        yieldTimeMs: waitMs,
         maxOutputTokens,
       });
 
@@ -783,7 +783,7 @@ function registerCodexProcessTools(
         chars: z.string().optional().describe("Characters to write. Omit or pass an empty string to poll."),
         columns: z.number().int().min(1).max(1_000).optional().describe("Resize a PTY to this width."),
         rows: z.number().int().min(1).max(1_000).optional().describe("Resize a PTY to this height."),
-        yieldTimeMs: z
+        waitMs: z
           .number()
           .int()
           .min(0)
@@ -802,7 +802,7 @@ function registerCodexProcessTools(
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, sessionId, chars, columns, rows, yieldTimeMs, maxOutputTokens }) => {
+    async ({ workspaceId, sessionId, chars, columns, rows, waitMs, maxOutputTokens }) => {
       const startedAt = performance.now();
       workspaces.getWorkspace(workspaceId);
       const snapshot = await processSessions.write({
@@ -811,7 +811,7 @@ function registerCodexProcessTools(
         chars,
         columns,
         rows,
-        yieldTimeMs,
+        yieldTimeMs: waitMs,
         maxOutputTokens,
       });
 
