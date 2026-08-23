@@ -91,6 +91,10 @@ export class AgentDaemonUnavailableError extends TaggedError(
   "AgentDaemonUnavailableError",
 )<AgentDaemonErrorFields & { code: "DAEMON_UNAVAILABLE" }>() {}
 
+export class InteractiveAgentHostUnavailableError extends TaggedError(
+  "InteractiveAgentHostUnavailableError",
+)<AgentDaemonErrorFields & { code: "INTERACTIVE_AGENT_HOST_UNAVAILABLE" }>() {}
+
 export class AgentDaemonStartupError extends TaggedError(
   "AgentDaemonStartupError",
 )<AgentDaemonErrorFields & { code: "DAEMON_STARTUP_FAILURE" }>() {}
@@ -121,6 +125,7 @@ export class AgentDaemonInternalError extends TaggedError(
 
 export type AgentDaemonError =
   | AgentDaemonUnavailableError
+  | InteractiveAgentHostUnavailableError
   | AgentDaemonStartupError
   | AgentDaemonTimeoutError
   | AgentDaemonProtocolMismatchError
@@ -176,6 +181,7 @@ export function isAgentProviderError(error: unknown): error is AgentProviderErro
 
 export function isAgentDaemonError(error: unknown): error is AgentDaemonError {
   return AgentDaemonUnavailableError.is(error)
+    || InteractiveAgentHostUnavailableError.is(error)
     || AgentDaemonStartupError.is(error)
     || AgentDaemonTimeoutError.is(error)
     || AgentDaemonProtocolMismatchError.is(error)
@@ -204,6 +210,7 @@ export function toAgentErrorPayload(error: LocalAgentError): AgentErrorPayload {
     AgentProviderProtocolError: providerErrorPayload,
     AgentProviderExecutionError: providerErrorPayload,
     AgentDaemonUnavailableError: daemonErrorPayload,
+    InteractiveAgentHostUnavailableError: daemonErrorPayload,
     AgentDaemonStartupError: daemonErrorPayload,
     AgentDaemonTimeoutError: daemonErrorPayload,
     AgentDaemonProtocolMismatchError: daemonErrorPayload,
@@ -291,6 +298,13 @@ export function agentErrorFromPayload(payload: {
       return new AgentDaemonUnavailableError({
         code: payload.code,
         operation: payload.operation ?? "request",
+        retryable,
+        message: payload.message,
+      });
+    case "INTERACTIVE_AGENT_HOST_UNAVAILABLE":
+      return new InteractiveAgentHostUnavailableError({
+        code: payload.code,
+        operation: payload.operation ?? "startup",
         retryable,
         message: payload.message,
       });

@@ -76,6 +76,7 @@ const daemon = new LocalAgentDaemon({
 const client = new LocalAgentClient({
   stateDir: join(root, "state"),
   startupTimeoutMs: 2_000,
+  platform: "linux",
   requestTimeoutMs: 2_000,
   spawnDaemon: () => { void daemon.start(); },
 });
@@ -85,6 +86,7 @@ let diagnosticSpawnCount = 0;
 const missingDaemonClient = new LocalAgentClient({
   stateDir: missingDaemonStateDir,
   startupTimeoutMs: 50,
+  platform: "linux",
   requestTimeoutMs: 50,
   spawnDaemon: () => { diagnosticSpawnCount += 1; },
 });
@@ -145,6 +147,7 @@ const idleDaemon = new LocalAgentDaemon({
 const idleClient = new LocalAgentClient({
   stateDir: idleStateDir,
   startupTimeoutMs: 2_000,
+  platform: "linux",
   requestTimeoutMs: 2_000,
   spawnDaemon: () => { void idleDaemon.start(); },
 });
@@ -158,6 +161,19 @@ try {
 }
 
 const ownershipStateDir = join(root, "ownership-state");
+const persistentStateDir = join(root, "persistent-state");
+const persistentManager = new FakeManager();
+persistentManager.activeTurnCount = 0;
+const persistentDaemon = new LocalAgentDaemon({
+  stateDir: persistentStateDir,
+  manager: persistentManager,
+  idleShutdownMs: null,
+  idleCheckIntervalMs: 10,
+});
+await persistentDaemon.start();
+await new Promise<void>((resolve) => setTimeout(resolve, 250));
+assert.equal(persistentManager.closed, false, "persistent daemon must not idle-shutdown");
+await persistentDaemon.close();
 const ownerManager = new FakeManager();
 const competingManager = new FakeManager();
 const ownerDaemon = new LocalAgentDaemon({
@@ -193,6 +209,7 @@ try {
   const ownerClient = new LocalAgentClient({
     stateDir: ownershipStateDir,
     spawnDaemon: () => { throw new Error("the winning daemon should already be reachable"); },
+  platform: "linux",
   });
   assert.equal(unwrap(await ownerClient.status()).pid, process.pid);
 } finally {
@@ -203,6 +220,7 @@ try {
 const startupFailureClient = new LocalAgentClient({
   stateDir: join(root, "startup-failure-state"),
   startupTimeoutMs: 20,
+  platform: "linux",
   requestTimeoutMs: 10,
   spawnDaemon: () => { throw new Error("spawn failed"); },
 });
@@ -253,6 +271,7 @@ const legacyServer = createNetServer((socket) => {
         protocolVersion: 1,
         pid: process.pid,
         endpoint: upgradePaths.endpoint,
+        host: { pid: process.pid, platform: "win32", windowsSessionId: 1, interactive: true },
         startedAt: "now",
         activeTurns: 0,
         runtimeCount: 0,
@@ -284,6 +303,7 @@ const upgradeClient = new LocalAgentClient({
   stateDir: upgradeStateDir,
   startupTimeoutMs: 2_000,
   requestTimeoutMs: 500,
+  platform: "linux",
   spawnDaemon: () => {
     replacementSpawns += 1;
     spawnedBeforeLegacyLockReleased = existsSync(upgradePaths.lockPath);
@@ -291,10 +311,10 @@ const upgradeClient = new LocalAgentClient({
   },
 });
 try {
-  assert.equal(unwrap(await upgradeClient.ensureReady()).protocolVersion, 3);
+  assert.equal(unwrap(await upgradeClient.ensureReady()).protocolVersion, 4);
   assert.equal(replacementSpawns, 1);
   assert.equal(spawnedBeforeLegacyLockReleased, false);
-  assert.deepEqual(legacyMethods.slice(0, 3), ["hello:3", "hello:1", "daemon.stop:1"]);
+  assert.deepEqual(legacyMethods.slice(0, 3), ["hello:4", "hello:1", "daemon.stop:1"]);
 } finally {
   legacyLock.release();
   await replacementDaemon.close();
@@ -339,6 +359,7 @@ const replacementRaceServer = createNetServer((socket) => {
         protocolVersion: replacementRaceProtocol,
         pid: process.pid,
         endpoint: replacementRacePaths.endpoint,
+        host: { pid: process.pid, platform: "win32", windowsSessionId: 1, interactive: true },
         startedAt: "now",
         activeTurns: 0,
         runtimeCount: 0,
@@ -358,6 +379,7 @@ await new Promise<void>((resolveListen, rejectListen) => {
 const replacementRaceClient = new LocalAgentClient({
   stateDir: replacementRaceStateDir,
   startupTimeoutMs: 500,
+  platform: "linux",
   requestTimeoutMs: 100,
   spawnDaemon: () => {
     throw new Error("the replacement daemon is already running");
@@ -387,13 +409,14 @@ const timeoutServer = createNetServer((socket) => {
     if (request.method !== "hello") return;
     socket.end(encodeLocalAgentDaemonResponse({
       requestId: request.requestId,
-      protocolVersion: 3,
+      protocolVersion: 4,
       ok: true,
       result: {
         state: "ready",
-        protocolVersion: 3,
+        protocolVersion: 4,
         pid: process.pid,
         endpoint: timeoutPaths.endpoint,
+        host: { pid: process.pid, platform: "win32", windowsSessionId: 1, interactive: true },
         startedAt: "now",
         activeTurns: 0,
         runtimeCount: 0,
@@ -410,6 +433,7 @@ try {
   const timeoutClient = new LocalAgentClient({
     stateDir: timeoutStateDir,
     endpoint: timeoutPaths.endpoint,
+  platform: "linux",
     requestTimeoutMs: 20,
     spawnDaemon: () => { throw new Error("existing daemon should be used"); },
   });
@@ -433,7 +457,7 @@ const invalidServer = createNetServer((socket) => {
     if (!buffer.includes("\n")) return;
     socket.end(encodeLocalAgentDaemonResponse({
       requestId: "wrong_request_id",
-      protocolVersion: 3,
+      protocolVersion: 4,
       ok: true,
       result: {},
     }));
@@ -447,6 +471,7 @@ try {
   const invalidClient = new LocalAgentClient({
     stateDir: invalidStateDir,
     endpoint: invalidPaths.endpoint,
+  platform: "linux",
     requestTimeoutMs: 50,
     spawnDaemon: () => { throw new Error("existing daemon should be used"); },
   });
@@ -487,7 +512,7 @@ try {
 
   const unauthorized = await sendRawRequest(socketDaemon.paths.endpoint, JSON.stringify({
     requestId: "unauthorized",
-    protocolVersion: 3,
+    protocolVersion: 4,
     authToken: "wrong-secret",
     method: "hello",
     params: {},

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { createRequire } from "node:module";
+import { spawn } from "node:child_process";
 import { stdin as input, stdout as output } from "node:process";
 import { resolve } from "node:path";
 import type { Result as BetterResult } from "better-result";
@@ -23,7 +24,7 @@ import {
   parseLocalAgentContinueArgs,
   parseLocalAgentRunArgs,
 } from "./local-agent-targets.js";
-import { createLocalAgentClient } from "./local-agent-client.js";
+import { createLocalAgentClient, daemonExecArgv, resolveDaemonEntrypoint } from "./local-agent-client.js";
 import { toAgentErrorPayload, type LocalAgentError } from "./local-agent-errors.js";
 import {
   formatAgentObservation,
@@ -51,9 +52,11 @@ import {
   type DevspaceUserConfig,
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
+import { assertInteractiveWindowsSession, getCurrentWindowsSessionId } from "./windows-session.js";
+import { installWindowsAgentHost, uninstallWindowsAgentHost } from "./windows-agent-host.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 
-type Command = "serve" | "init" | "doctor" | "config" | "agents" | "help" | "version";
+type Command = "serve" | "init" | "doctor" | "config" | "agents" | "agent-host" | "help" | "version";
 const require = createRequire(import.meta.url);
 const SUPPORTED_NODE_RANGE = ">=20.12 <27";
 
@@ -81,6 +84,9 @@ async function main(argv: string[]): Promise<void> {
       await runAgentsCommand(args);
       return;
     case "help":
+    case "agent-host":
+      await runAgentHostCommand(args);
+      return;
       printHelp();
       return;
     case "version":
@@ -91,7 +97,7 @@ async function main(argv: string[]): Promise<void> {
 
 function normalizeCommand(command: string | undefined): Command {
   if (!command || command === "serve" || command === "start") return "serve";
-  if (command === "init" || command === "doctor" || command === "config" || command === "agents") return command;
+  if (command === "init" || command === "doctor" || command === "config" || command === "agents" || command === "agent-host") return command;
   if (command === "help" || command === "--help" || command === "-h") return "help";
   if (command === "version" || command === "--version" || command === "-v") return "version";
   throw new Error(`Unknown command: ${command}`);
@@ -394,6 +400,7 @@ function printHelp(): void {
       "  devspace agents show <id>",
       "  devspace agents daemon <status|stop|logs>",
       "  devspace -v, --version   Print the installed version",
+      "  devspace agent-host <run|install|status|uninstall>",
       "",
       "For temporary tunnels:",
       "  DEVSPACE_PUBLIC_BASE_URL=https://example.trycloudflare.com devspace serve",
@@ -401,6 +408,99 @@ function printHelp(): void {
   );
 }
 
+// agent-host commands
+async function runAgentHostCommand(args: string[]): Promise<void> {
+  const [subcommand, ...extra] = args;
+  if (extra.length > 0) throw new Error("Usage: devspace agent-host <run|install|status|uninstall>");
+  switch (subcommand) {
+    case "run":
+      await runAgentHostRun();
+      return;
+    case "install":
+      installWindowsAgentHost();
+      console.log("DevSpace agent host will start automatically at the next Windows login.");
+      console.log("To start it now, run:");
+      console.log("devspace agent-host run");
+      return;
+    case "status":
+      await runAgentHostStatus();
+      return;
+    case "uninstall":
+      uninstallWindowsAgentHost();
+      console.log("DevSpace agent host login startup removed.");
+      return;
+    case undefined:
+    case "help":
+    case "--help":
+    case "-h":
+      printAgentHostHelp();
+      return;
+    default:
+      throw new Error("Usage: devspace agent-host <run|install|status|uninstall>");
+  }
+}
+
+async function runAgentHostRun(): Promise<void> {
+  if (process.platform === "win32") {
+    const sessionId = getCurrentWindowsSessionId();
+    assertInteractiveWindowsSession(sessionId);
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      [...daemonExecArgv(process.execArgv), resolveDaemonEntrypoint()],
+      {
+        detached: false,
+        stdio: "inherit",
+        windowsHide: false,
+        env: { ...process.env, DEVSPACE_AGENTD_PERSISTENT: "1" },
+      },
+    );
+    child.once("error", reject);
+    child.once("exit", (code, signal) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(`Agent host exited with ${signal ? `signal ${signal}` : `code ${code ?? "unknown"}`}.`));
+    });
+  });
+}
+
+async function runAgentHostStatus(): Promise<void> {
+  const client = createLocalAgentClient(loadConfig());
+  const result = await client.status();
+  if (result.isErr()) {
+    if (result.error.code === "DAEMON_UNAVAILABLE" || result.error.code === "DAEMON_TIMEOUT") {
+      console.log("Agent host: not running");
+      return;
+    }
+    throw new Error(result.error.message);
+  }
+  const host = result.value.host;
+  console.log("Agent host: running");
+  console.log(`PID: ${host.pid}`);
+  console.log(`Platform: ${host.platform}`);
+  console.log(`Windows session: ${host.windowsSessionId ?? "n/a"}`);
+  console.log(`Interactive: ${host.interactive === null ? "n/a" : host.interactive ? "yes" : "no"}`);
+  console.log(`Endpoint: ${result.value.endpoint}`);
+  if (host.platform === "win32" && host.windowsSessionId === 0) {
+    console.warn("WARNING: local coding agents must not run in Windows Session 0.");
+  }
+}
+
+function printAgentHostHelp(): void {
+  console.log([
+    "DevSpace agent-host",
+    "",
+    "Usage:",
+    "  devspace agent-host run",
+    "  devspace agent-host install",
+    "  devspace agent-host status",
+    "  devspace agent-host uninstall",
+  ].join("\n"));
+}
 async function runAgentsCommand(args: string[]): Promise<void> {
   const [subcommand, ...rest] = args;
   const { args: commandArgs, json } = extractJsonOption(rest);

@@ -94,7 +94,7 @@ try {
       if (request.method === "agent.start") {
         socket.end(encodeLocalAgentDaemonResponse({
           requestId: request.requestId,
-          protocolVersion: 3,
+          protocolVersion: 4,
           ok: false,
           error: {
             code: "UNKNOWN_TARGET",
@@ -110,9 +110,10 @@ try {
         : request.method === "hello"
           ? {
               state: "ready",
-              protocolVersion: 3,
+              protocolVersion: 4,
               pid: process.pid,
               endpoint: daemonSocket,
+              host: { pid: process.pid, platform: "win32", windowsSessionId: 1, interactive: true },
               startedAt: "now",
               activeTurns: 0,
               runtimeCount: 0,
@@ -121,7 +122,7 @@ try {
           : null;
       socket.end(encodeLocalAgentDaemonResponse({
         requestId: request.requestId,
-        protocolVersion: 3,
+        protocolVersion: 4,
         ok: true,
         result,
       }));

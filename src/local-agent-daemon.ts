@@ -29,6 +29,7 @@ import {
   type LocalAgentDaemonErrorPayload,
   type LocalAgentDaemonResponse,
   type LocalAgentDaemonStatus,
+  type LocalAgentDaemonHost,
   LocalAgentDaemonProtocolError,
 } from "./local-agent-daemon-protocol.js";
 import type { Result } from "better-result";
@@ -40,6 +41,7 @@ import type {
   RunOverrides,
   StartLocalAgentInput,
 } from "./local-agent-manager.js";
+import { getCurrentWindowsSessionId } from "./windows-session.js";
 import type { LocalAgentRecord, LocalAgentWorkspaceScope } from "./local-agent-store.js";
 
 const MAX_REQUEST_BYTES = 512 * 1024;
@@ -62,13 +64,14 @@ export interface LocalAgentDaemonManager {
 export interface LocalAgentDaemonOptions {
   stateDir: string;
   manager: LocalAgentDaemonManager;
-  idleShutdownMs?: number;
+  idleShutdownMs?: number | null;
   idleCheckIntervalMs?: number;
   requestReadTimeoutMs?: number;
   shutdownTimeoutMs?: number;
   now?: () => number;
   paths?: LocalAgentDaemonPaths;
   onLockAcquired?: () => void | Promise<void>;
+  host?: LocalAgentDaemonHost;
   onClosed?: () => void;
 }
 
@@ -76,10 +79,11 @@ export class LocalAgentDaemon {
   readonly paths: LocalAgentDaemonPaths;
   private readonly manager: LocalAgentDaemonManager;
   private readonly lock: LocalAgentDaemonLock;
-  private readonly idleShutdownMs: number;
+  private readonly idleShutdownMs: number | null;
   private readonly idleCheckIntervalMs: number;
   private readonly requestReadTimeoutMs: number;
   private readonly shutdownTimeoutMs: number;
+  private readonly host: LocalAgentDaemonHost;
   private readonly now: () => number;
   private readonly onLockAcquired?: () => void | Promise<void>;
   private readonly onClosed?: () => void;
@@ -98,14 +102,15 @@ export class LocalAgentDaemon {
     this.paths = options.paths ?? localAgentDaemonPaths(options.stateDir);
     this.manager = options.manager;
     this.lock = new LocalAgentDaemonLock(this.paths);
-    this.idleShutdownMs = options.idleShutdownMs ?? DEFAULT_DAEMON_IDLE_SHUTDOWN_MS;
+    this.idleShutdownMs = options.idleShutdownMs === undefined ? DEFAULT_DAEMON_IDLE_SHUTDOWN_MS : options.idleShutdownMs;
     this.idleCheckIntervalMs = options.idleCheckIntervalMs ?? DEFAULT_IDLE_CHECK_INTERVAL_MS;
     this.requestReadTimeoutMs = options.requestReadTimeoutMs ?? DEFAULT_REQUEST_READ_TIMEOUT_MS;
     this.shutdownTimeoutMs = options.shutdownTimeoutMs ?? DEFAULT_DAEMON_SHUTDOWN_TIMEOUT_MS;
     this.now = options.now ?? Date.now;
     this.onLockAcquired = options.onLockAcquired;
+    this.host = options.host ?? currentDaemonHost();
     this.onClosed = options.onClosed;
-    if (!Number.isFinite(this.idleShutdownMs) || this.idleShutdownMs < 0) {
+    if (this.idleShutdownMs !== null && (!Number.isFinite(this.idleShutdownMs) || this.idleShutdownMs < 0)) {
       throw new Error("Agent daemon idle shutdown must be a non-negative finite duration.");
     }
     if (!Number.isFinite(this.requestReadTimeoutMs) || this.requestReadTimeoutMs <= 0) {
@@ -134,14 +139,16 @@ export class LocalAgentDaemon {
       this.startedAt = new Date(this.now()).toISOString();
       this.accepting = true;
       this.stopping = false;
-      this.idleTimer = setInterval(() => {
-        void this.maintainIdle().catch((error) => {
-          writeLocalAgentDaemonLog(this.paths, "warn", "daemon_idle_check_failed", {
-            error: errorMessage(error),
+      if (this.idleShutdownMs !== null) {
+        this.idleTimer = setInterval(() => {
+          void this.maintainIdle().catch((error) => {
+            writeLocalAgentDaemonLog(this.paths, "warn", "daemon_idle_check_failed", {
+              error: errorMessage(error),
+            });
           });
-        });
-      }, this.idleCheckIntervalMs);
-      this.idleTimer.unref();
+        }, this.idleCheckIntervalMs);
+        this.idleTimer.unref();
+      }
       writeLocalAgentDaemonLog(this.paths, "info", "daemon_started", { pid: process.pid });
       return this.status();
     } catch (error) {
@@ -164,6 +171,7 @@ export class LocalAgentDaemon {
       protocolVersion: LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
       pid: process.pid,
       endpoint: this.paths.endpoint,
+      host: this.host,
       startedAt: this.startedAt,
       activeTurns: this.manager.activeTurnCount,
       runtimeCount: this.manager.runtimeCount,
@@ -336,6 +344,7 @@ export class LocalAgentDaemon {
 
   private async maintainIdle(): Promise<void> {
     await this.manager.evictIdle(this.now());
+    if (this.idleShutdownMs === null) return;
     if (this.stopping || this.manager.activeTurnCount > 0 || this.manager.runtimeCount > 0 || this.sockets.size > 0) {
       this.idleSince = undefined;
       return;
@@ -344,6 +353,25 @@ export class LocalAgentDaemon {
     this.idleSince ??= now;
     if (now - this.idleSince >= this.idleShutdownMs) await this.close();
   }
+}
+
+function currentDaemonHost(): LocalAgentDaemonHost {
+  // Host metadata is derived once when the daemon starts.
+  if (process.platform !== "win32") {
+    return {
+      pid: process.pid,
+      platform: process.platform,
+      windowsSessionId: null,
+      interactive: null,
+    };
+  }
+  const windowsSessionId = getCurrentWindowsSessionId();
+  return {
+    pid: process.pid,
+    platform: process.platform,
+    windowsSessionId,
+    interactive: windowsSessionId > 0,
+  };
 }
 
 async function listen(server: NetServer, endpoint: string): Promise<void> {

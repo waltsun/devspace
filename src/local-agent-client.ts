@@ -14,6 +14,7 @@ import {
   AgentDaemonUnauthorizedError,
   AgentDaemonUnavailableError,
   agentErrorFromPayload,
+  InteractiveAgentHostUnavailableError,
   isAgentDaemonError,
   isProgrammerDefect,
   type AgentDaemonError,
@@ -66,6 +67,7 @@ export interface LocalAgentClientOptions {
   startupTimeoutMs?: number;
   requestTimeoutMs?: number;
   spawnDaemon?: () => void;
+  platform?: NodeJS.Platform;
   endpoint?: string;
 }
 
@@ -75,6 +77,7 @@ export class LocalAgentClient {
   private readonly endpoint: string;
   private readonly startupTimeoutMs: number;
   private readonly requestTimeoutMs: number;
+  private readonly platform: NodeJS.Platform;
   private readonly spawnDaemon: () => void;
   private startupPromise?: Promise<BetterResult<LocalAgentDaemonStatus, AgentDaemonError>>;
 
@@ -82,6 +85,7 @@ export class LocalAgentClient {
     this.stateDir = options.stateDir;
     this.paths = localAgentDaemonPaths(options.stateDir);
     this.endpoint = options.endpoint ?? this.paths.endpoint;
+    this.platform = options.platform ?? process.platform;
     this.startupTimeoutMs = options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS;
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.spawnDaemon = options.spawnDaemon ?? (() => spawnLocalAgentDaemon(options.stateDir));
@@ -158,6 +162,14 @@ export class LocalAgentClient {
     if (existing.isErr()) return existing;
     if (existing.value) return Result.ok(existing.value);
 
+    if (this.platform === "win32") {
+      return Result.err(new InteractiveAgentHostUnavailableError({
+        code: "INTERACTIVE_AGENT_HOST_UNAVAILABLE",
+        operation: "startup",
+        retryable: true,
+        message: interactiveAgentHostUnavailableMessage(),
+      }));
+    }
     try {
       this.spawnDaemon();
     } catch (cause) {
@@ -221,6 +233,15 @@ export class LocalAgentClient {
           message: "Local agent daemon returned an invalid hello error.",
         }));
       }
+      if (this.platform === "win32" && error.code !== "DAEMON_UNAVAILABLE") {
+        return Result.err(new InteractiveAgentHostUnavailableError({
+          code: "INTERACTIVE_AGENT_HOST_UNAVAILABLE",
+          operation: "hello",
+          retryable: true,
+          cause: error,
+          message: interactiveAgentHostUnavailableMessage(),
+        }));
+      }
       if (
         error.code === "DAEMON_PROTOCOL_MISMATCH"
         && response.value.protocolVersion < LOCAL_AGENT_DAEMON_PROTOCOL_VERSION
@@ -230,7 +251,17 @@ export class LocalAgentClient {
       return error.code === "DAEMON_UNAVAILABLE" ? Result.ok(undefined) : Result.err(error);
     }
     const decoded = decodeValue(response.value.result, "hello", decodeDaemonStatus);
-    return decoded.map((status) => status.state === "ready" ? status : undefined);
+    if (decoded.isErr()) return decoded;
+    const status = decoded.value;
+    if (this.platform === "win32" && status.host.platform === "win32" && status.host.windowsSessionId === 0) {
+      return Result.err(new InteractiveAgentHostUnavailableError({
+        code: "INTERACTIVE_AGENT_HOST_UNAVAILABLE",
+        operation: "hello",
+        retryable: false,
+        message: interactiveAgentHostSessionZeroMessage(),
+      }));
+    }
+    return Result.ok(status.state === "ready" ? status : undefined);
   }
 
   private async replaceIdleOlderDaemon(
@@ -512,6 +543,25 @@ async function sendRequest(
   });
 }
 
+// Interactive host diagnostics
+function interactiveAgentHostUnavailableMessage(): string {
+  return [
+    "The DevSpace interactive agent host is not running.",
+    "Start it from an interactive Windows user session with:",
+    "devspace agent-host run",
+    "",
+    "To start it automatically after login:",
+    "devspace agent-host install",
+  ].join("\n");
+}
+
+function interactiveAgentHostSessionZeroMessage(): string {
+  return [
+    "A DevSpace agent host was found, but it is running in Windows Session 0.",
+    "Local coding agents require an interactive Windows session.",
+  ].join(" ");
+}
+
 function decodeRequestResult<T, E extends LocalAgentError>(
   result: BetterResult<unknown, E>,
   operation: string,
@@ -566,6 +616,7 @@ function isRequestError(
     AgentProviderExecutionError: () => "provider" as const,
     AgentDaemonUnavailableError: () => "daemon" as const,
     AgentDaemonStartupError: () => "daemon" as const,
+    InteractiveAgentHostUnavailableError: () => "daemon" as const,
     AgentDaemonTimeoutError: () => "daemon" as const,
     AgentDaemonProtocolMismatchError: () => "daemon" as const,
     AgentDaemonUnauthorizedError: () => "daemon" as const,

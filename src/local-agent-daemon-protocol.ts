@@ -41,11 +41,18 @@ interface AgentDaemonRequestBase<
   params: P;
 }
 
+export interface LocalAgentDaemonHost {
+  pid: number;
+  platform: NodeJS.Platform;
+  windowsSessionId: number | null;
+  interactive: boolean | null;
+}
 export interface LocalAgentDaemonStatus {
   state: "ready" | "stopping";
   protocolVersion: number;
   pid: number;
   endpoint: string;
+  host: LocalAgentDaemonHost;
   startedAt: string;
   activeTurns: number;
   runtimeCount: number;
@@ -213,10 +220,37 @@ export function decodeDaemonStatus(value: unknown): LocalAgentDaemonStatus {
     protocolVersion: requiredInteger(record?.protocolVersion, "protocolVersion"),
     pid: requiredInteger(record?.pid, "pid"),
     endpoint: requiredString(record?.endpoint, "endpoint"),
+    host: decodeDaemonHost(record?.host),
     startedAt: requiredString(record?.startedAt, "startedAt"),
     activeTurns: requiredInteger(record?.activeTurns, "activeTurns"),
     runtimeCount: requiredInteger(record?.runtimeCount, "runtimeCount"),
     clientConnections: requiredInteger(record?.clientConnections, "clientConnections"),
+  };
+}
+
+function decodeDaemonHost(value: unknown): LocalAgentDaemonHost {
+  const record = asRecord(value);
+  const platform = requiredString(record?.platform, "host.platform");
+  if (!isNodePlatform(platform)) {
+    throw new LocalAgentDaemonProtocolError("INVALID_RESULT", "Daemon returned an invalid host platform.");
+  }
+  const windowsSessionId = record?.windowsSessionId === null
+    ? null
+    : requiredInteger(record?.windowsSessionId, "host.windowsSessionId");
+  const interactive = record?.interactive === null
+    ? null
+    : requiredBoolean(record?.interactive, "host.interactive");
+  if (platform === "win32" && (windowsSessionId === null || interactive === null)) {
+    throw new LocalAgentDaemonProtocolError("INVALID_RESULT", "Windows daemon host metadata is incomplete.");
+  }
+  if (platform !== "win32" && (windowsSessionId !== null || interactive !== null)) {
+    throw new LocalAgentDaemonProtocolError("INVALID_RESULT", "Non-Windows daemon host metadata is invalid.");
+  }
+  return {
+    pid: requiredInteger(record?.pid, "host.pid"),
+    platform,
+    windowsSessionId,
+    interactive,
   };
 }
 
@@ -323,6 +357,13 @@ function requiredInteger(value: unknown, field: string): number {
   return value;
 }
 
+function requiredBoolean(value: unknown, field: string): boolean {
+  if (typeof value !== "boolean") {
+    throw new LocalAgentDaemonProtocolError("INVALID_PROTOCOL", `Invalid ${field}.`);
+  }
+  return value;
+}
+
 function optionalString(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
@@ -336,6 +377,18 @@ function optionalContentString(value: unknown): string | undefined {
 
 function optionalBoolean(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
+}
+
+function isNodePlatform(value: string): value is NodeJS.Platform {
+  return value === "aix"
+    || value === "android"
+    || value === "darwin"
+    || value === "freebsd"
+    || value === "haiku"
+    || value === "linux"
+    || value === "openbsd"
+    || value === "sunos"
+    || value === "win32";
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

@@ -38,7 +38,7 @@ const daemon = new LocalAgentDaemon({
     if (reconciled.isErr()) throw reconciled.error;
   },
   onClosed: () => { if (!shuttingDown) process.exit(0); },
-  idleShutdownMs: parseIdleShutdownMs(process.env.DEVSPACE_AGENTD_IDLE_TIMEOUT_MS),
+  idleShutdownMs: process.env.DEVSPACE_AGENTD_PERSISTENT === "1" ? null : parseIdleShutdownMs(process.env.DEVSPACE_AGENTD_IDLE_TIMEOUT_MS),
 });
 
 let shuttingDown = false;
