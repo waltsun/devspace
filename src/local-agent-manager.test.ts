@@ -5,12 +5,15 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { LocalAgentManager } from "./local-agent-manager.js";
 import {
+  AgentProviderCancelledError,
   AgentProviderExecutionError,
   type AgentProviderError,
 } from "./local-agent-errors.js";
 import type { LocalAgentProfile } from "./local-agent-profiles.js";
 import type {
   LocalAgentDriver,
+  LocalAgentRunCallbacks,
+  LocalAgentRunControl,
   LocalAgentRunInput,
   LocalAgentRunResult,
   LocalAgentRuntime,
@@ -49,17 +52,60 @@ const subagents: SubagentsConfig = {
 class FakeRuntime implements LocalAgentRuntime {
   readonly provider = "codex" as const;
   readonly inputs: LocalAgentRunInput[] = [];
+  readonly controls: Array<LocalAgentRunControl | undefined> = [];
+  abortEvents = 0;
+  immediateWorkStarted = false;
   closed = false;
   private releaseHold: (() => void) | undefined;
 
   async run(
     input: LocalAgentRunInput,
-    callbacks?: { onSessionId?: (id: string) => void | Promise<void> },
+    callbacks?: LocalAgentRunCallbacks,
+    control?: LocalAgentRunControl,
   ): Promise<BetterResult<LocalAgentRunResult, AgentProviderError>> {
     this.inputs.push(input);
+    this.controls.push(control);
     if (input.prompt.includes("early-fail")) {
       await callbacks?.onSessionId?.("thread_early");
       return Result.err(providerFailure("provider failed after session creation"));
+    }
+    if (input.prompt.includes("provider-cancel-throw")) {
+      await callbacks?.onSessionId?.("thread_external_throw");
+      throw providerCancelled("provider threw an interruption");
+    }
+    if (input.prompt.includes("provider-cancel")) {
+      await callbacks?.onSessionId?.("thread_external");
+      return Result.err(providerCancelled("provider interrupted the turn"));
+    }
+    if (input.prompt.includes("immediate-cancel")) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (control?.signal?.aborted) return Result.err(providerCancelled("provider cancelled before work"));
+      this.immediateWorkStarted = true;
+    }
+    if (input.prompt.includes("cancel-pending")) {
+      await callbacks?.onSessionId?.("thread_cancel");
+      await new Promise<void>((resolve) => {
+        const signal = control?.signal;
+        if (!signal) throw new Error("Cancellation test runtime did not receive a signal.");
+        const onAbort = () => { this.abortEvents += 1; };
+        signal.addEventListener("abort", onAbort, { once: true });
+        this.releaseHold = () => {
+          signal.removeEventListener("abort", onAbort);
+          resolve();
+        };
+        if (signal.aborted) onAbort();
+      });
+      return Result.err(providerCancelled("provider cancelled the turn"));
+    }
+    if (input.prompt.includes("cancel-normal")) {
+      await new Promise<void>((resolve) => {
+        const signal = control?.signal;
+        if (!signal) throw new Error("Cancellation test runtime did not receive a signal.");
+        const onAbort = () => { this.abortEvents += 1; resolve(); };
+        signal.addEventListener("abort", onAbort, { once: true });
+        this.releaseHold = resolve;
+        if (signal.aborted) onAbort();
+      });
     }
     if (input.prompt.includes("defect")) throw new TypeError("internal defect");
     if (input.prompt.includes("fail")) return Result.err(providerFailure("provider failed"));
@@ -68,7 +114,7 @@ class FakeRuntime implements LocalAgentRuntime {
     }
     return Result.ok({
       provider: this.provider,
-      providerSessionId: "thread_test",
+      providerSessionId: input.providerSessionId === "thread_cancel" ? "thread_cancel" : "thread_test",
       finalResponse: `response:${input.prompt}`,
       items: [],
     });
@@ -107,6 +153,16 @@ const driver: LocalAgentDriver = {
 function providerFailure(message: string): AgentProviderExecutionError {
   return new AgentProviderExecutionError({
     code: "PROVIDER_EXECUTION_ERROR",
+    provider: "codex",
+    operation: "run",
+    retryable: false,
+    message,
+  });
+}
+
+function providerCancelled(message: string): AgentProviderCancelledError {
+  return new AgentProviderCancelledError({
+    code: "PROVIDER_CANCELLED",
     provider: "codex",
     operation: "run",
     retryable: false,
@@ -277,6 +333,106 @@ assert.equal(getRecord(failed.id).errorRetryable, false);
 const recovered = unwrap(await manager.continue(failed.id, "recovered", {}, scope));
 assert.equal(recovered.status, "running", "provider Err releases active-turn ownership");
 await waitFor(() => getRecord(failed.id).status === "idle");
+
+const cancellable = unwrap(await manager.start({
+  target: "reviewer",
+  prompt: "cancel-pending",
+  workspaceId: scope.workspaceId,
+  workspaceRoot: root,
+}));
+await waitFor(() => runtimes.get(cancellable.id)?.inputs.length === 1);
+const cancellableRuntime = runtimes.get(cancellable.id)!;
+assert.equal(cancellableRuntime.controls[0]?.signal?.aborted, false);
+const wrongCancelScope = manager.cancel(cancellable.id, {
+  workspaceId: scope.workspaceId,
+  workspaceRoot: join(root, "other"),
+});
+assert.equal(wrongCancelScope.isErr(), true);
+if (wrongCancelScope.isErr()) assert.equal(wrongCancelScope.error.code, "WORKSPACE_MISMATCH");
+assert.equal(cancellableRuntime.controls[0]?.signal?.aborted, false);
+
+const cancelRequest = manager.cancel(cancellable.id, scope);
+assert.equal(cancelRequest.isOk(), true);
+if (cancelRequest.isOk()) assert.equal(cancelRequest.value.status, "running");
+assert.equal(getRecord(cancellable.id).status, "running");
+const repeatedCancel = manager.cancel(cancellable.id, scope);
+assert.equal(repeatedCancel.isOk(), true);
+assert.equal(cancellableRuntime.controls[0]?.signal?.aborted, true);
+assert.equal(cancellableRuntime.abortEvents, 1, "AbortSignal dispatches one abort event for repeated requests");
+const continueWhileCancelling = await manager.continue(cancellable.id, "too soon", {}, scope);
+assert.equal(continueWhileCancelling.isErr(), true);
+if (continueWhileCancelling.isErr()) assert.equal(continueWhileCancelling.error.code, "AGENT_CONFLICT");
+assert.equal(getRecord(cancellable.id).status, "running");
+cancellableRuntime.release();
+await waitFor(() => getRecord(cancellable.id).status === "stopped");
+assert.equal(getRecord(cancellable.id).latestResponse, undefined);
+assert.equal(getRecord(cancellable.id).error, undefined);
+assert.equal(getRecord(cancellable.id).errorCode, undefined);
+assert.equal(getRecord(cancellable.id).errorRetryable, undefined);
+assert.equal(getRecord(cancellable.id).providerSessionId, "thread_cancel");
+
+const resumed = unwrap(await manager.continue(cancellable.id, "resume after stop", {}, scope));
+assert.equal(resumed.status, "running");
+await waitFor(() => getRecord(cancellable.id).status === "idle");
+assert.equal(cancellableRuntime.inputs.at(-1)?.providerSessionId, "thread_cancel");
+
+const noActiveTurn = manager.cancel(cancellable.id, scope);
+assert.equal(noActiveTurn.isErr(), true);
+if (noActiveTurn.isErr()) {
+  assert.equal(noActiveTurn.error.code, "AGENT_CONFLICT");
+  assert.equal(noActiveTurn.error.operation, "cancel");
+  assert.equal(noActiveTurn.error.retryable, false);
+}
+
+const normalRace = unwrap(await manager.start({
+  target: "reviewer",
+  prompt: "cancel-normal",
+  workspaceId: scope.workspaceId,
+  workspaceRoot: root,
+}));
+await waitFor(() => runtimes.get(normalRace.id)?.inputs.length === 1);
+const normalRaceRuntime = runtimes.get(normalRace.id)!;
+assert.equal(manager.cancel(normalRace.id, scope).isOk(), true);
+await waitFor(() => getRecord(normalRace.id).status === "idle");
+assert.match(getRecord(normalRace.id).latestResponse ?? "", /cancel-normal/);
+assert.equal(normalRaceRuntime.controls[0]?.signal?.aborted, true);
+
+const externalCancellation = unwrap(await manager.start({
+  target: "reviewer",
+  prompt: "provider-cancel",
+  workspaceId: scope.workspaceId,
+  workspaceRoot: root,
+}));
+await waitFor(() => getRecord(externalCancellation.id).status === "stopped");
+assert.equal(getRecord(externalCancellation.id).providerSessionId, "thread_external");
+assert.equal(getRecord(externalCancellation.id).error, undefined);
+assert.equal(getRecord(externalCancellation.id).errorCode, undefined);
+
+const thrownExternalCancellation = unwrap(await manager.start({
+  target: "reviewer",
+  prompt: "provider-cancel-throw",
+  workspaceId: scope.workspaceId,
+  workspaceRoot: root,
+}));
+await waitFor(() => getRecord(thrownExternalCancellation.id).status === "stopped");
+assert.equal(getRecord(thrownExternalCancellation.id).providerSessionId, "thread_external_throw");
+assert.equal(getRecord(thrownExternalCancellation.id).error, undefined);
+assert.equal(getRecord(thrownExternalCancellation.id).errorCode, undefined);
+
+const immediate = unwrap(await manager.start({
+  target: "reviewer",
+  prompt: "immediate-cancel",
+  workspaceId: scope.workspaceId,
+  workspaceRoot: root,
+}));
+const immediateCancel = manager.cancel(immediate.id, scope);
+assert.equal(immediateCancel.isOk(), true);
+await waitFor(() => getRecord(immediate.id).status === "stopped");
+assert.equal(runtimes.get(immediate.id)?.immediateWorkStarted ?? false, false, "pre-aborted turn does not execute provider work");
+
+const missingCancel = manager.cancel("agt_missing", scope);
+assert.equal(missingCancel.isErr(), true);
+if (missingCancel.isErr()) assert.equal(missingCancel.error.code, "AGENT_NOT_FOUND");
 
 const earlyFailure = unwrap(await manager.start({
   target: "reviewer",

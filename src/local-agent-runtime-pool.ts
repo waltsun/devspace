@@ -7,6 +7,7 @@ import {
 import type {
   LocalAgentDriver,
   LocalAgentRunCallbacks,
+  LocalAgentRunControl,
   LocalAgentRunInput,
   LocalAgentRunResult,
   LocalAgentRuntime,
@@ -76,6 +77,7 @@ export class LocalAgentRuntimePool {
     context: LocalAgentRuntimeContext,
     input: LocalAgentRunInput,
     inputCallbacks?: LocalAgentRunCallbacks,
+    control?: LocalAgentRunControl,
   ): Promise<BetterResult<LocalAgentRunResult, AgentProviderError>> {
     if (this.closing) return Result.err(poolClosedError(driver, context));
 
@@ -134,7 +136,7 @@ export class LocalAgentRuntimePool {
     try {
       const inputReservationError = await reserveSession(input.providerSessionId ?? "");
       if (inputReservationError) return Result.err(inputReservationError);
-      const result = await runtime.run(input, callbacks);
+      const result = await runtime.run(input, callbacks, control);
       if (result.isErr()) {
         if (!runtime.isAlive()) {
           try {

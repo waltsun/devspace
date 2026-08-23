@@ -9,6 +9,7 @@ import {
 import { LocalAgentRuntimePool } from "./local-agent-runtime-pool.js";
 import type {
   LocalAgentDriver,
+  LocalAgentRunControl,
   LocalAgentRunInput,
   LocalAgentRunResult,
   LocalAgentRuntime,
@@ -41,6 +42,7 @@ class FakeRuntime implements LocalAgentRuntime {
   closeCount = 0;
   runCount = 0;
   readonly releasedSessions: string[] = [];
+  readonly controls: Array<LocalAgentRunControl | undefined> = [];
   private readonly pending: Array<() => void> = [];
   releaseBlocked = false;
   releaseStarted = false;
@@ -56,9 +58,14 @@ class FakeRuntime implements LocalAgentRuntime {
     this.releaseResolve = undefined;
   }
 
-  async run(runInput: LocalAgentRunInput): Promise<BetterResult<LocalAgentRunResult, AgentProviderError>> {
+  async run(
+    runInput: LocalAgentRunInput,
+    _callbacks?: unknown,
+    control?: LocalAgentRunControl,
+  ): Promise<BetterResult<LocalAgentRunResult, AgentProviderError>> {
     assert.equal(this.releaseInFlight, false, "a session turn must not overlap session release");
     this.runCount += 1;
+    this.controls.push(control);
     if (runInput.prompt === "wait") await new Promise<void>((resolve) => this.pending.push(resolve));
     return Result.ok({
       provider: this.provider,
@@ -111,6 +118,12 @@ assert.equal(createCount, 1, "runtime creation is single-flight per runtime key"
 assert.equal(unwrap(first).finalResponse, "done:inspect");
 assert.equal(unwrap(second).finalResponse, "done:second");
 assert.equal(runtime.runCount, 2);
+assert.equal(runtime.controls[0], undefined);
+const passthroughController = new AbortController();
+await pool.run(driver, context, { ...input, prompt: "control" }, undefined, {
+  signal: passthroughController.signal,
+});
+assert.equal(runtime.controls.at(-1)?.signal, passthroughController.signal);
 
 const running = pool.run(driver, context, { ...input, prompt: "wait", providerSessionId: "thread_1" });
 await new Promise<void>((resolve) => setImmediate(resolve));

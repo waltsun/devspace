@@ -71,6 +71,12 @@ export type AgentStartError = AgentTargetError | AgentScopeError | AgentConflict
 export type AgentContinueError = AgentStartError;
 export type AgentLookupError = AgentTargetError | AgentScopeError | AgentStoreError;
 export type AgentListError = AgentScopeError | AgentStoreError;
+export type AgentCancelError = AgentTargetError | AgentScopeError | AgentConflictError | AgentStoreError;
+
+interface ActiveLocalAgentTurn {
+  promise: Promise<void>;
+  controller: AbortController;
+}
 
 /**
  * Owns one durable DevSpace agent's turn lifecycle. Provider runtimes remain
@@ -86,7 +92,7 @@ export class LocalAgentManager {
   private readonly allowedRoots?: readonly string[];
   private readonly logger?: LocalAgentManagerLogger;
   private readonly subagents: SubagentsConfig;
-  private readonly activeTurns = new Map<string, Promise<void>>();
+  private readonly activeTurns = new Map<string, ActiveLocalAgentTurn>();
   private accepting = true;
   private closePromise?: Promise<void>;
 
@@ -177,6 +183,37 @@ export class LocalAgentManager {
     });
   }
 
+  cancel(
+    agentId: string,
+    scope: LocalAgentWorkspaceScope,
+  ): BetterResult<LocalAgentRecord, AgentCancelError> {
+    const accepting = this.acceptingResult("cancel", agentId);
+    if (accepting.isErr()) return accepting;
+    const lookup = this.store.getByIdResult(agentId);
+    if (lookup.isErr()) return lookup;
+    const record = lookup.value;
+    if (!record) return Result.err(agentNotFound(agentId));
+    const scoped = this.agentWorkspaceResult(record, scope, "cancel");
+    if (scoped.isErr()) return scoped;
+    const active = this.activeTurns.get(agentId);
+    if (!active) {
+      return Result.err(new AgentConflictError({
+        code: "AGENT_CONFLICT",
+        agentId,
+        operation: "cancel",
+        retryable: false,
+        message: `Agent ${agentId} has no active turn to cancel.`,
+      }));
+    }
+    active.controller.abort();
+    this.log("info", "agent_cancel_requested", {
+      provider: record.provider,
+      agentId: record.id,
+      providerSessionIdPrefix: record.providerSessionId?.slice(0, 8),
+    });
+    return Result.ok(record);
+  }
+
   get(
     agentId: string,
     scope: LocalAgentWorkspaceScope,
@@ -202,7 +239,7 @@ export class LocalAgentManager {
   async close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.accepting = false;
-    const turns = Array.from(this.activeTurns.values());
+    const turns = Array.from(this.activeTurns.values(), (turn) => turn.promise);
     this.closePromise = (async () => {
       // Closing pooled runtimes is what interrupts provider turns. Waiting for
       // those turns first can strand a provider process indefinitely.
@@ -256,12 +293,13 @@ export class LocalAgentManager {
       errorRetryable: undefined,
     });
     if (updated.isErr()) return updated;
+    const controller = new AbortController();
     // Defer invocation until after the tracking entry is visible. This keeps
     // cleanup correct even if runTurn later gains a synchronous completion path.
     const turn = Promise.resolve().then(() => (
-      this.runTurn(updated.value, prompt, overrides, workspaceId)
+      this.runTurn(updated.value, prompt, overrides, workspaceId, controller.signal)
     ));
-    this.activeTurns.set(record.id, turn);
+    this.activeTurns.set(record.id, { promise: turn, controller });
     void turn.catch(() => undefined);
     return updated;
   }
@@ -270,7 +308,8 @@ export class LocalAgentManager {
     record: LocalAgentRecord,
     prompt: string,
     overrides: RunOverrides,
-    workspaceId?: string,
+    workspaceId: string | undefined,
+    signal: AbortSignal,
   ): Promise<void> {
     const startedAt = Date.now();
     this.log("info", "agent_run_started", {
@@ -279,6 +318,10 @@ export class LocalAgentManager {
       providerSessionIdPrefix: record.providerSessionId?.slice(0, 8),
     });
     try {
+      if (signal.aborted) {
+        this.persistRunCancelled(record, startedAt);
+        return;
+      }
       const authorized = this.authorizeWorkspace(record.workspaceRoot, workspaceId, "run");
       if (authorized.isErr()) {
         this.persistRunError(record, authorized.error, startedAt);
@@ -327,9 +370,13 @@ export class LocalAgentManager {
           if (updated.isErr()) throw updated.error;
         },
       };
-      const result = await this.pool.run(driver.value, context, input.value, callbacks);
+      if (signal.aborted) {
+        this.persistRunCancelled(record, startedAt);
+        return;
+      }
+      const result = await this.pool.run(driver.value, context, input.value, callbacks, { signal });
       if (result.isErr()) {
-        this.persistRunError(record, result.error, startedAt);
+        this.persistRunTerminalError(record, result.error, startedAt);
         return;
       }
       const runResult = result.value;
@@ -353,7 +400,7 @@ export class LocalAgentManager {
       });
     } catch (error) {
       if (isLocalAgentError(error)) {
-        this.persistRunError(record, error, startedAt);
+        this.persistRunTerminalError(record, error, startedAt);
         return;
       }
       const persisted = this.store.updateResult(record.id, {
@@ -396,6 +443,35 @@ export class LocalAgentManager {
       errorCode: error.code,
       error: error.message,
       causeType: safeCauseType("cause" in error ? error.cause : undefined),
+      persistenceFailed: persisted.isErr(),
+    });
+  }
+
+  private persistRunTerminalError(
+    record: LocalAgentRecord,
+    error: LocalAgentError,
+    startedAt: number,
+  ): void {
+    if (error.code === "PROVIDER_CANCELLED") {
+      this.persistRunCancelled(record, startedAt);
+      return;
+    }
+    this.persistRunError(record, error, startedAt);
+  }
+
+  private persistRunCancelled(record: LocalAgentRecord, startedAt: number): void {
+    const persisted = this.store.updateResult(record.id, {
+      status: "stopped",
+      latestResponse: undefined,
+      error: undefined,
+      errorCode: undefined,
+      errorRetryable: undefined,
+    });
+    this.log("info", "agent_run_cancelled", {
+      provider: record.provider,
+      agentId: record.id,
+      providerSessionIdPrefix: record.providerSessionId?.slice(0, 8),
+      durationMs: Math.max(0, Date.now() - startedAt),
       persistenceFailed: persisted.isErr(),
     });
   }
