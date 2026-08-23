@@ -19,6 +19,7 @@ try {
   process.env.USERPROFILE = root;
   const projectRoot = join(root, "project");
   const agentDir = join(root, "agent");
+  const cleanAgentDir = join(root, "clean-agent");
   const explicitSkills = join(root, "explicit-skills");
   const devspaceSkills = join(root, ".devspace", "skills");
   const globalAgentsSkills = join(root, ".agents", "skills");
@@ -32,6 +33,7 @@ try {
   await mkdir(join(projectRoot, ".pi", "skills", "project-skill"), { recursive: true });
   await mkdir(join(agentDir, "skills", "global-skill"), { recursive: true });
   await mkdir(join(agentDir, "skills", "subagents"), { recursive: true });
+  await mkdir(join(cleanAgentDir, "skills"), { recursive: true });
   await mkdir(join(explicitSkills, "duplicate"), { recursive: true });
   await mkdir(join(explicitSkills, "disabled"), { recursive: true });
   await mkdir(join(explicitSkills, "subagents"), { recursive: true });
@@ -207,6 +209,22 @@ try {
       (skill) => skill.name === "subagents",
     ),
     true,
+    "an explicitly installed subagents skill remains available when subagents are enabled",
+  );
+
+  const noBundledFallbackConfig = loadConfig({
+    DEVSPACE_ALLOWED_ROOTS: projectRoot,
+    DEVSPACE_AGENT_DIR: cleanAgentDir,
+    DEVSPACE_SUBAGENTS: "1",
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    PORT: "1",
+  });
+  assert.equal(
+    loadWorkspaceSkills(noBundledFallbackConfig, projectRoot).skills.some(
+      (skill) => skill.name === "subagents",
+    ),
+    false,
+    "enabling subagents must not auto-inject DevSpace's bundled CLI subagents skill",
   );
 
   const duplicateConfig = loadConfig({
