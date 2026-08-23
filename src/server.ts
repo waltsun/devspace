@@ -55,6 +55,12 @@ import { shutdownHttpServer } from "./server-shutdown.js";
 import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
+import type { LocalAgentError } from "./local-agent-errors.js";
+import {
+  createLocalAgentClient,
+  type LocalAgentClient,
+} from "./local-agent-client.js";
+import type { LocalAgentRecord } from "./local-agent-store.js";
 import {
   getLocalAgentProviderAvailabilitySnapshot,
 } from "./local-agent-availability.js";
@@ -89,6 +95,18 @@ const SHELL_TOOL_ANNOTATIONS = {
   destructiveHint: true,
   idempotentHint: false,
   openWorldHint: true,
+};
+const AGENT_START_ANNOTATIONS = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
+  openWorldHint: true,
+};
+const AGENT_WAIT_ANNOTATIONS = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
 };
 
 interface RunningServer {
@@ -201,9 +219,12 @@ function serverInstructions(config: ServerConfig): string {
     config.widgets === "changes"
       ? " If the turn successfully modifies files by creating, editing, overwriting, deleting, moving, or applying patches, call show_changes exactly once for that workspace after the final related file change and before your final response so the user can inspect the aggregate diff for that turn. Do not call it after every individual file change; do not skip it because individual file-change tools already returned diffs."
       : "";
+  const subagentInstruction = config.subagents.enabled
+    ? " When a suitable local coding agent is available and delegation is useful, use agent_start with the current workspaceId. agent_start returns immediately. Use agent_wait to wait for the current turn; a wait timeout does not stop the agent, so call agent_wait again if continued waiting is appropriate."
+    : "";
 
   if (config.toolMode === "codex") {
-    return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}`;
+    return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${subagentInstruction}${artifactInstruction}${showChangesInstruction}`;
   }
 
   const inspection = config.toolMode !== "full"
@@ -216,7 +237,7 @@ function serverInstructions(config: ServerConfig): string {
 
   const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
 
-  return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}`;
+  return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${subagentInstruction}${artifactInstruction}${showChangesInstruction}`;
 }
 
 function formatVisibleAgent(agent: {
@@ -252,6 +273,67 @@ function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
         "Model-readable result text for follow-up reasoning and plain MCP hosts.",
       ),
     ...extra,
+  };
+}
+
+export type LocalAgentMcpClient = Pick<LocalAgentClient, "start" | "wait">;
+
+function agentOutputSchema(): z.ZodRawShape {
+  return {
+    id: z.string(),
+    status: z.enum(["starting", "running", "idle", "error", "stopped"]),
+    target: z.string(),
+    provider: z.string(),
+    model: z.string().optional(),
+    effort: z.string().optional(),
+    providerSessionId: z.string().optional(),
+    latestResponse: z.string().optional(),
+    error: z.string().optional(),
+    errorCode: z.string().optional(),
+    errorRetryable: z.boolean().optional(),
+  };
+}
+
+function agentStartOutputSchema(): z.ZodRawShape {
+  return resultOutputSchema({
+    agent: z.object(agentOutputSchema()),
+  });
+}
+
+function agentWaitOutputSchema(): z.ZodRawShape {
+  return resultOutputSchema({
+    agent: z.object(agentOutputSchema()),
+    timedOut: z.boolean(),
+  });
+}
+
+function agentOutput(record: LocalAgentRecord) {
+  return {
+    id: record.id,
+    status: record.status,
+    target: record.profileName,
+    provider: record.provider,
+    model: record.model,
+    effort: record.effort,
+    providerSessionId: record.providerSessionId,
+    latestResponse: record.latestResponse,
+    error: record.error,
+    errorCode: record.errorCode,
+    errorRetryable: record.errorRetryable,
+  };
+}
+
+function agentErrorResponse(error: LocalAgentError) {
+  const result = `${error.code}: ${error.message}`;
+  return {
+    content: [textBlock(result)],
+    isError: true as const,
+    structuredContent: {
+      result,
+      error: error.message,
+      errorCode: error.code,
+      errorRetryable: error.retryable,
+    },
   };
 }
 
@@ -704,6 +786,137 @@ function registerCodexProcessTools(
   );
 }
 
+function registerLocalAgentTools(
+  server: McpServer,
+  config: ServerConfig,
+  workspaces: WorkspaceRegistry,
+  client: LocalAgentMcpClient,
+): void {
+  registerAppTool(
+    server,
+    "agent_start",
+    {
+      title: "Start agent",
+      description:
+        "Start a durable local coding-agent turn in an existing DevSpace workspace. The call returns immediately after the turn is started; it does not wait for completion. Use agent_wait to wait for the current turn to finish.",
+      inputSchema: {
+        workspaceId: z.string().describe(workspaceIdDescription),
+        target: z.string().min(1).describe("Agent profile name or provider target."),
+        prompt: z.string().min(1).describe("Prompt for the coding-agent turn."),
+        model: z.string().optional().describe("Optional provider model override."),
+        effort: z.string().optional().describe("Optional provider effort override."),
+        writeMode: z
+          .enum(["read_only", "allowed", "full_access"])
+          .optional()
+          .describe("Optional workspace write policy override."),
+      },
+      outputSchema: agentStartOutputSchema(),
+      _meta: {},
+      annotations: AGENT_START_ANNOTATIONS,
+    },
+    async ({ workspaceId, target, prompt, model, effort, writeMode }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const response = await client.start({
+        target,
+        prompt,
+        workspaceId: workspace.id,
+        workspaceRoot: workspace.root,
+        model,
+        effort,
+        writeMode,
+      });
+
+      if (response.isErr()) {
+        const errorResponse = agentErrorResponse(response.error);
+        logFailedToolResponse(config, {
+          tool: "agent_start",
+          workspaceId,
+        }, errorResponse.content, startedAt);
+        return errorResponse;
+      }
+
+      const agent = agentOutput(response.value);
+      const result = `Started agent ${agent.id} with target ${agent.target}; status: ${agent.status}.`;
+      const content = [textBlock(result)];
+      logToolCall(config, {
+        tool: "agent_start",
+        workspaceId,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        content,
+        structuredContent: { result, agent },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "agent_wait",
+    {
+      title: "Wait for agent",
+      description:
+        "Wait for an existing local coding-agent turn to finish, for at most 20 seconds. A timeout does not cancel or stop the agent. Call it again to continue waiting.",
+      inputSchema: {
+        workspaceId: z.string().describe(workspaceIdDescription),
+        agentId: z.string().min(1).describe("Durable agent identifier returned by agent_start."),
+        timeoutMs: z
+          .number()
+          .int()
+          .min(1)
+          .max(20_000)
+          .optional()
+          .describe("Milliseconds to wait, from 1 through 20000. Defaults to 20000."),
+      },
+      outputSchema: agentWaitOutputSchema(),
+      _meta: {},
+      annotations: AGENT_WAIT_ANNOTATIONS,
+    },
+    async ({ workspaceId, agentId, timeoutMs }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const scope = {
+        workspaceId: workspace.id,
+        workspaceRoot: workspace.root,
+      };
+      const response = timeoutMs === undefined
+        ? await client.wait(agentId, scope)
+        : await client.wait(agentId, scope, timeoutMs);
+
+      if (response.isErr()) {
+        const errorResponse = agentErrorResponse(response.error);
+        logFailedToolResponse(config, {
+          tool: "agent_wait",
+          workspaceId,
+        }, errorResponse.content, startedAt);
+        return errorResponse;
+      }
+
+      const agent = agentOutput(response.value.record);
+      const result = response.value.timedOut
+        ? `Agent ${agent.id} is still running after the wait timeout.`
+        : `Agent ${agent.id} finished its current turn with status ${agent.status}.`;
+      const content = [textBlock(result)];
+      logToolCall(config, {
+        tool: "agent_wait",
+        workspaceId,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        content,
+        structuredContent: {
+          result,
+          agent,
+          timedOut: response.value.timedOut,
+        },
+      };
+    },
+  );
+}
+
 export function createMcpServer(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
@@ -711,6 +924,7 @@ export function createMcpServer(
   processSessions: ProcessSessionManager,
   resolveLocalAgentProviders: () => LocalAgentProviderStatus[],
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
+  localAgentClient?: LocalAgentMcpClient,
 ): McpServer {
   const server = new McpServer(
     {
@@ -1656,6 +1870,15 @@ export function createMcpServer(
 
   if (config.toolMode === "codex") {
     registerCodexProcessTools(server, config, workspaces, processSessions);
+  }
+
+  if (config.subagents.enabled) {
+    registerLocalAgentTools(
+      server,
+      config,
+      workspaces,
+      localAgentClient ?? createLocalAgentClient(config),
+    );
   }
 
   if (config.artifactsEnabled && isArtifactDownloadSupportedPlatform()) {
