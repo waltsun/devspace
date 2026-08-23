@@ -614,6 +614,7 @@ function isRequestError(
     AgentProviderCancelledError: () => "provider" as const,
     AgentProviderProtocolError: () => "provider" as const,
     AgentProviderExecutionError: () => "provider" as const,
+    AgentProviderInfrastructureError: () => "provider" as const,
     AgentDaemonUnavailableError: () => "daemon" as const,
     AgentDaemonStartupError: () => "daemon" as const,
     InteractiveAgentHostUnavailableError: () => "daemon" as const,

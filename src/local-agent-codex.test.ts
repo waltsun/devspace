@@ -1,17 +1,177 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { spawn, type ChildProcessWithoutNullStreams, type SpawnOptions } from "node:child_process";
+import { PassThrough } from "node:stream";
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import {
   CodexAppServerRuntime,
   CodexLocalAgentDriver,
+  isCodexWindowsSandboxRunnerStartupFailure,
+  probeCodexWindowsSandbox,
   codexCommandEnvironment,
   parseCodexVersion,
   resolveCodexCommand,
   sandboxFor,
 } from "./local-agent-codex.js";
-import { toAgentErrorPayload } from "./local-agent-errors.js";
+import {
+  AgentProviderInfrastructureError,
+  agentErrorFromPayload,
+  isAgentProviderError,
+  toAgentErrorPayload,
+} from "./local-agent-errors.js";
 
+
+function fakeProbeChild() {
+  const child = new EventEmitter() as unknown as ChildProcessWithoutNullStreams;
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  let killed = false;
+  Object.assign(child, {
+    stdout,
+    stderr,
+    pid: undefined,
+    killed: false,
+    exitCode: null,
+    kill: () => {
+      killed = true;
+      return true;
+    },
+  });
+  return {
+    child,
+    stdout,
+    stderr,
+    events: child as unknown as EventEmitter,
+    wasKilled: () => killed,
+  };
+}
+
+const probeInput = {
+  command: "C:/Codex/codex.exe",
+  version: "0.149.0",
+  env: { PATH: "C:/Windows/System32" },
+  workspaceRoot: "C:/workspace",
+};
+
+let capturedProbeCommand = "";
+let capturedProbeArgs: string[] = [];
+let capturedProbeOptions: SpawnOptions | undefined;
+const successfulProbeChild = fakeProbeChild();
+const successfulProbeSpawn = ((command: string, args: string[], options: SpawnOptions) => {
+  capturedProbeCommand = command;
+  capturedProbeArgs = args;
+  capturedProbeOptions = options;
+  return successfulProbeChild.child;
+}) as unknown as typeof spawn;
+const successfulProbe = probeCodexWindowsSandbox(probeInput, successfulProbeSpawn);
+successfulProbeChild.stdout.emit("data", "DEVSPACE_CODEX_SANDBOX_OK");
+successfulProbeChild.events.emit("close", 0, null);
+await successfulProbe;
+assert.equal(capturedProbeCommand, probeInput.command);
+assert.deepEqual(capturedProbeArgs, [
+  "sandbox",
+  "--permission-profile",
+  ":workspace",
+  "-C",
+  probeInput.workspaceRoot,
+  "--",
+  "powershell.exe",
+  "-NoProfile",
+  "-NonInteractive",
+  "-Command",
+  "$ErrorActionPreference='Stop'; $null = Get-Location; Write-Output 'DEVSPACE_CODEX_SANDBOX_OK'",
+]);
+assert.equal(capturedProbeArgs.includes("windows"), false);
+assert.equal(capturedProbeOptions?.cwd, probeInput.workspaceRoot);
+assert.deepEqual(capturedProbeOptions?.stdio, ["pipe", "pipe", "pipe"]);
+
+assert.equal(isCodexWindowsSandboxRunnerStartupFailure("timed out after 15000ms connecting runner pipe-in"), true);
+assert.equal(isCodexWindowsSandboxRunnerStartupFailure("timed out after 16000ms connecting runner pipe-out"), true);
+assert.equal(isCodexWindowsSandboxRunnerStartupFailure("timed out after 15000ms connecting runner pipe"), false);
+
+async function rejectedProbe(
+  child: ReturnType<typeof fakeProbeChild>,
+  stderr: string,
+  exitCode: number | null,
+  timeoutMs?: number,
+) {
+  const promise = probeCodexWindowsSandbox(
+    probeInput,
+    (() => child.child) as unknown as typeof spawn,
+    timeoutMs,
+  );
+  if (stderr) child.stderr.emit("data", stderr);
+  if (exitCode !== null) child.events.emit("close", exitCode, null);
+  return promise.then(
+    () => { throw new Error("Expected sandbox probe to fail."); },
+    (error) => error,
+  );
+}
+
+const markerMissing = await rejectedProbe(fakeProbeChild(), "", 0);
+assert.equal(markerMissing.code, "PROVIDER_INFRASTRUCTURE_ERROR");
+assert.equal(markerMissing.retryable, false);
+assert.match(markerMissing.message, /did not execute the expected probe command/);
+
+const knownRunnerIn = fakeProbeChild();
+const knownRunnerInError = await rejectedProbe(knownRunnerIn, "Failed to create unified exec process: timed out after 15000ms connecting runner pipe-in", 1);
+assert.equal(knownRunnerInError.code, "PROVIDER_INFRASTRUCTURE_ERROR");
+assert.match(knownRunnerInError.message, /command runner failed to start/);
+
+const knownRunnerOut = fakeProbeChild();
+const knownRunnerOutError = await rejectedProbe(knownRunnerOut, "timed out after 15000ms connecting runner pipe-out", 1);
+assert.equal(knownRunnerOutError.code, "PROVIDER_INFRASTRUCTURE_ERROR");
+assert.match(knownRunnerOutError.message, /command runner failed to start/);
+
+const genericFailure = await rejectedProbe(fakeProbeChild(), "windows sandbox: setup refresh failed with status exit code: 1", 1);
+assert.equal(genericFailure.code, "PROVIDER_INFRASTRUCTURE_ERROR");
+assert.equal(genericFailure.retryable, false);
+assert.match(genericFailure.message, /Diagnostic: windows sandbox: setup refresh failed/);
+
+const timeoutChild = fakeProbeChild();
+const timeoutError = await rejectedProbe(timeoutChild, "", null, 5);
+assert.equal(timeoutError.code, "PROVIDER_INFRASTRUCTURE_ERROR");
+assert.equal(timeoutError.retryable, false);
+assert.match(timeoutError.message, /timed out after 20000ms/);
+assert.equal(timeoutChild.wasKilled(), true);
+
+const enoentChild = fakeProbeChild();
+const enoentPromise = probeCodexWindowsSandbox(probeInput, (() => enoentChild.child) as unknown as typeof spawn);
+enoentChild.events.emit("error", Object.assign(new Error("spawn codex failed"), { code: "ENOENT" }));
+const enoentError = await enoentPromise.then(
+  () => { throw new Error("Expected ENOENT probe to fail."); },
+  (error) => error,
+);
+assert.equal(enoentError.code, "PROVIDER_UNAVAILABLE");
+assert.equal(enoentError.retryable, false);
+
+const infrastructure = new AgentProviderInfrastructureError({
+  code: "PROVIDER_INFRASTRUCTURE_ERROR",
+  provider: "codex",
+  agentId: "agt_test",
+  operation: "sandbox_preflight",
+  retryable: false,
+  message: "sandbox failed",
+});
+assert.equal(isAgentProviderError(infrastructure), true);
+const infrastructurePayload = toAgentErrorPayload(infrastructure);
+assert.deepEqual(infrastructurePayload, {
+  code: "PROVIDER_INFRASTRUCTURE_ERROR",
+  message: "sandbox failed",
+  retryable: false,
+  provider: "codex",
+  agentId: "agt_test",
+  operation: "sandbox_preflight",
+});
+const reconstructedInfrastructure = agentErrorFromPayload(infrastructurePayload);
+assert.ok(reconstructedInfrastructure);
+assert.equal(reconstructedInfrastructure?.code, infrastructure.code);
+assert.equal(reconstructedInfrastructure?.message, infrastructure.message);
+assert.equal(reconstructedInfrastructure?.retryable, infrastructure.retryable);
+assert.equal(reconstructedInfrastructure?.provider, infrastructure.provider);
+assert.equal(reconstructedInfrastructure?.operation, infrastructure.operation);
 let resolverCalls = 0;
 const cachedDriver = new CodexLocalAgentDriver(
   { CODEX_HOME: "/tmp/codex-home" },
@@ -149,6 +309,59 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   } finally {
     await runtime.close();
     await runtime.close();
+
+    let successfulDriverProbeCalls = 0;
+    const successfulDriver = new CodexLocalAgentDriver(
+      process.env,
+      () => ({ executable: command, version: "9.8.7" }),
+      async (input) => {
+        successfulDriverProbeCalls += 1;
+        assert.equal(input.command, command);
+        assert.equal(input.workspaceRoot, root);
+      },
+      "win32",
+    );
+    const successfulRuntimeOne = await successfulDriver.createRuntime({ ...cachedContext, workspaceRoot: root });
+    assert.equal(successfulRuntimeOne.isOk(), true);
+    if (successfulRuntimeOne.isOk()) await successfulRuntimeOne.value.close();
+    const successfulRuntimeTwo = await successfulDriver.createRuntime({ ...cachedContext, workspaceRoot: root });
+    assert.equal(successfulRuntimeTwo.isOk(), true);
+    if (successfulRuntimeTwo.isOk()) await successfulRuntimeTwo.value.close();
+    assert.equal(successfulDriverProbeCalls, 1, "successful sandbox probe is cached per driver");
+
+    let failedDriverProbeCalls = 0;
+    const failedDriver = new CodexLocalAgentDriver(
+      process.env,
+      () => ({ executable: command, version: "9.8.7" }),
+      async () => {
+        failedDriverProbeCalls += 1;
+        throw new AgentProviderInfrastructureError({
+          code: "PROVIDER_INFRASTRUCTURE_ERROR",
+          provider: "codex",
+          operation: "sandbox_preflight",
+          retryable: false,
+          message: "sandbox failed",
+        });
+      },
+      "win32",
+    );
+    const failedRuntimeOne = await failedDriver.createRuntime({ ...cachedContext, workspaceRoot: root });
+    const failedRuntimeTwo = await failedDriver.createRuntime({ ...cachedContext, workspaceRoot: root });
+    assert.equal(failedRuntimeOne.isErr(), true);
+    assert.equal(failedRuntimeTwo.isErr(), true);
+    assert.equal(failedDriverProbeCalls, 1, "failed sandbox probe is cached per driver");
+
+    let skippedDriverProbeCalls = 0;
+    const skippedDriver = new CodexLocalAgentDriver(
+      process.env,
+      () => ({ executable: command, version: "9.8.7" }),
+      async () => { skippedDriverProbeCalls += 1; },
+      "linux",
+    );
+    const skippedRuntime = await skippedDriver.createRuntime({ ...cachedContext, workspaceRoot: root });
+    assert.equal(skippedRuntime.isOk(), true);
+    if (skippedRuntime.isOk()) await skippedRuntime.value.close();
+    assert.equal(skippedDriverProbeCalls, 0, "non-Windows driver skips sandbox probe");
     await rm(root, { recursive: true, force: true });
   }
 }

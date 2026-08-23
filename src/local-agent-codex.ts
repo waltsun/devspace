@@ -4,6 +4,7 @@ import { delimiter, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import {
   AgentProviderExecutionError,
+  AgentProviderInfrastructureError,
   AgentProviderProtocolError,
   AgentProviderUnavailableError,
   captureAgentProviderResult,
@@ -26,6 +27,187 @@ export interface ResolvedCodexCommand {
 }
 
 export type CodexCommandResolver = (env: NodeJS.ProcessEnv) => ResolvedCodexCommand | undefined;
+export interface CodexWindowsSandboxProbeInput {
+  command: string;
+  version?: string;
+  env: NodeJS.ProcessEnv;
+  workspaceRoot: string;
+}
+
+export type CodexSandboxProbe = (input: CodexWindowsSandboxProbeInput) => Promise<void>;
+
+const CODEX_WINDOWS_SANDBOX_PROBE_TIMEOUT_MS = 20_000;
+const CODEX_SANDBOX_PROBE_MARKER = "DEVSPACE_CODEX_SANDBOX_OK";
+const MAX_CODEX_DIAGNOSTIC_BYTES = 32 * 1024;
+const MAX_CODEX_DIAGNOSTIC_CHARS = 1_000;
+const CODEX_WINDOWS_SANDBOX_PROBE_SCRIPT = "$ErrorActionPreference='Stop'; $null = Get-Location; Write-Output 'DEVSPACE_CODEX_SANDBOX_OK'";
+
+export function isCodexWindowsSandboxRunnerStartupFailure(text: string): boolean {
+  return /timed out after \d+ms connecting runner pipe-(?:in|out)/i.test(text);
+}
+
+export async function probeCodexWindowsSandbox(
+  input: CodexWindowsSandboxProbeInput,
+  spawnImpl: typeof spawn = spawn,
+  timeoutMs = CODEX_WINDOWS_SANDBOX_PROBE_TIMEOUT_MS,
+): Promise<void> {
+  const args = [
+    "sandbox",
+    "--permission-profile",
+    ":workspace",
+    "-C",
+    input.workspaceRoot,
+    "--",
+    "powershell.exe",
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
+    CODEX_WINDOWS_SANDBOX_PROBE_SCRIPT,
+  ];
+  let child: ChildProcessWithoutNullStreams;
+  try {
+    child = spawnImpl(input.command, args, {
+      cwd: input.workspaceRoot,
+      env: input.env,
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+      shell: usesWindowsCommandShell(input.command),
+    });
+  } catch (cause) {
+    throw codexSandboxProbeError(input, "", "", undefined, cause);
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let timedOut = false;
+    let timer: NodeJS.Timeout | undefined;
+
+    const finish = (error?: AgentProviderInfrastructureError | AgentProviderUnavailableError) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (error) reject(error);
+      else resolve();
+    };
+
+    child.stdout.on("data", (chunk: Buffer | string) => {
+      stdout = appendTail(stdout, chunk.toString(), MAX_CODEX_DIAGNOSTIC_BYTES);
+    });
+    child.stderr.on("data", (chunk: Buffer | string) => {
+      stderr = appendTail(stderr, chunk.toString(), MAX_CODEX_DIAGNOSTIC_BYTES);
+    });
+    child.once("error", (cause) => {
+      finish(codexSandboxProbeError(input, stdout, stderr, undefined, cause));
+    });
+    child.once("close", (code) => {
+      if (timedOut) {
+        finish(codexSandboxProbeError(input, stdout, stderr, undefined, undefined, true));
+        return;
+      }
+      if (code === 0 && stdout.includes(CODEX_SANDBOX_PROBE_MARKER)) {
+        finish();
+        return;
+      }
+      finish(codexSandboxProbeError(input, stdout, stderr, code));
+    });
+    timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        terminateProcessTree(child, "SIGTERM", false);
+      } catch {
+        // The probe has already failed; cleanup errors do not change its classification.
+      } finally {
+        finish(codexSandboxProbeError(input, stdout, stderr, undefined, undefined, true));
+      }
+    }, timeoutMs);
+  });
+}
+
+function codexSandboxProbeError(
+  input: CodexWindowsSandboxProbeInput,
+  stdout: string,
+  stderr: string,
+  exitCode?: number | null,
+  cause?: unknown,
+  timedOut = false,
+): AgentProviderInfrastructureError | AgentProviderUnavailableError {
+  const combined = `${stderr}\n${stdout}\n${cause === undefined ? "" : errorMessage(cause)}`;
+  if (errorCode(cause) === "ENOENT") {
+    return new AgentProviderUnavailableError({
+      code: "PROVIDER_UNAVAILABLE",
+      provider: "codex",
+      operation: "sandbox_preflight",
+      retryable: false,
+      cause,
+      message: "Codex executable became unavailable while starting the sandbox probe.",
+    });
+  }
+  if (isCodexWindowsSandboxRunnerStartupFailure(combined)) {
+    return new AgentProviderInfrastructureError({
+      code: "PROVIDER_INFRASTRUCTURE_ERROR",
+      provider: "codex",
+      operation: "sandbox_preflight",
+      retryable: false,
+      cause,
+      message: [
+        "Codex Windows sandbox command runner failed to start.",
+        "The sandbox probe timed out while connecting to the runner pipe.",
+        input.version ? `Codex version: ${input.version}` : undefined,
+      ].filter(Boolean).join("\n"),
+    });
+  }
+  if (timedOut) {
+    return new AgentProviderInfrastructureError({
+      code: "PROVIDER_INFRASTRUCTURE_ERROR",
+      provider: "codex",
+      operation: "sandbox_preflight",
+      retryable: false,
+      cause,
+      message: [
+        `Codex Windows sandbox health probe timed out after ${CODEX_WINDOWS_SANDBOX_PROBE_TIMEOUT_MS}ms.`,
+        input.version ? `Codex version: ${input.version}` : undefined,
+      ].filter(Boolean).join("\n"),
+    });
+  }
+  if (exitCode === 0 && !stdout.includes(CODEX_SANDBOX_PROBE_MARKER)) {
+    return new AgentProviderInfrastructureError({
+      code: "PROVIDER_INFRASTRUCTURE_ERROR",
+      provider: "codex",
+      operation: "sandbox_preflight",
+      retryable: false,
+      cause,
+      message: [
+        "Codex Windows sandbox health probe exited successfully but did not execute the expected probe command.",
+        input.version ? `Codex version: ${input.version}` : undefined,
+      ].filter(Boolean).join("\n"),
+    });
+  }
+  const diagnostic = truncateCodexDiagnostic(stderr.trim() || stdout.trim() || (cause === undefined ? "" : errorMessage(cause)));
+  return new AgentProviderInfrastructureError({
+    code: "PROVIDER_INFRASTRUCTURE_ERROR",
+    provider: "codex",
+    operation: "sandbox_preflight",
+    retryable: false,
+    cause,
+    message: [
+      "Codex Windows sandbox health probe failed before the agent turn started.",
+      diagnostic ? `Diagnostic: ${diagnostic}` : undefined,
+      input.version ? `Codex version: ${input.version}` : undefined,
+    ].filter(Boolean).join("\n"),
+  });
+}
+
+function truncateCodexDiagnostic(text: string): string {
+  return text.slice(0, MAX_CODEX_DIAGNOSTIC_CHARS);
+}
+
+function errorCode(error: unknown): string | undefined {
+  return error && typeof error === "object" && "code" in error
+    ? String((error as { code?: unknown }).code)
+    : undefined;
+}
 
 export function codexCommandEnvironment(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const next = { ...env };
@@ -233,10 +415,13 @@ export class CodexLocalAgentDriver implements LocalAgentDriver {
 
   private commandResolved = false;
   private resolvedCommand?: ResolvedCodexCommand;
+  private windowsSandboxProbe?: Promise<void>;
 
   constructor(
     private readonly env: NodeJS.ProcessEnv = process.env,
     private readonly commandResolver: CodexCommandResolver = resolveCodexCommand,
+    private readonly sandboxProbe: CodexSandboxProbe = probeCodexWindowsSandbox,
+    private readonly platform: NodeJS.Platform = process.platform,
   ) {}
 
   runtimeKey(_context: LocalAgentRuntimeContext): string {
@@ -246,7 +431,7 @@ export class CodexLocalAgentDriver implements LocalAgentDriver {
     return `codex:${executable}:${codexHome}`;
   }
 
-  async createRuntime(_context: LocalAgentRuntimeContext) {
+  async createRuntime(context: LocalAgentRuntimeContext) {
     return captureAgentProviderResult({
       provider: this.provider,
       operation: "create_runtime",
@@ -270,6 +455,7 @@ export class CodexLocalAgentDriver implements LocalAgentDriver {
             message: "Installed Codex does not support app-server.",
           });
         }
+        await this.ensureWindowsSandboxHealthy(command, context);
         const runtime = new CodexAppServerRuntime({
           command: command.executable,
           env: codexCommandEnvironment(this.env),
@@ -293,6 +479,21 @@ export class CodexLocalAgentDriver implements LocalAgentDriver {
     });
   }
 
+  private ensureWindowsSandboxHealthy(
+    command: ResolvedCodexCommand,
+    context: LocalAgentRuntimeContext,
+  ): Promise<void> {
+    if (this.platform !== "win32") return Promise.resolve();
+    if (!this.windowsSandboxProbe) {
+      this.windowsSandboxProbe = Promise.resolve().then(() => this.sandboxProbe({
+        command: command.executable,
+        version: command.version,
+        env: codexCommandEnvironment(this.env),
+        workspaceRoot: context.workspaceRoot,
+      }));
+    }
+    return this.windowsSandboxProbe;
+  }
   private resolveCommand(): ResolvedCodexCommand | undefined {
     if (!this.commandResolved) {
       this.resolvedCommand = this.commandResolver(this.env);

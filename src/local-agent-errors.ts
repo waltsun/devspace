@@ -74,11 +74,16 @@ export class AgentProviderExecutionError extends TaggedError(
   "AgentProviderExecutionError",
 )<AgentProviderErrorFields & { code: "PROVIDER_EXECUTION_ERROR" }>() {}
 
+export class AgentProviderInfrastructureError extends TaggedError(
+  "AgentProviderInfrastructureError",
+)<AgentProviderErrorFields & { code: "PROVIDER_INFRASTRUCTURE_ERROR" }>() {}
+
 export type AgentProviderError =
   | AgentProviderUnavailableError
   | AgentProviderCancelledError
   | AgentProviderProtocolError
-  | AgentProviderExecutionError;
+  | AgentProviderExecutionError
+  | AgentProviderInfrastructureError;
 
 interface AgentDaemonErrorFields extends Record<string, unknown> {
   operation: string;
@@ -176,7 +181,8 @@ export function isAgentProviderError(error: unknown): error is AgentProviderErro
   return AgentProviderUnavailableError.is(error)
     || AgentProviderCancelledError.is(error)
     || AgentProviderProtocolError.is(error)
-    || AgentProviderExecutionError.is(error);
+    || AgentProviderExecutionError.is(error)
+    || AgentProviderInfrastructureError.is(error);
 }
 
 export function isAgentDaemonError(error: unknown): error is AgentDaemonError {
@@ -209,6 +215,7 @@ export function toAgentErrorPayload(error: LocalAgentError): AgentErrorPayload {
     AgentProviderCancelledError: providerErrorPayload,
     AgentProviderProtocolError: providerErrorPayload,
     AgentProviderExecutionError: providerErrorPayload,
+    AgentProviderInfrastructureError: providerErrorPayload,
     AgentDaemonUnavailableError: daemonErrorPayload,
     InteractiveAgentHostUnavailableError: daemonErrorPayload,
     AgentDaemonStartupError: daemonErrorPayload,
@@ -272,7 +279,8 @@ export function agentErrorFromPayload(payload: {
     case "PROVIDER_UNAVAILABLE":
     case "PROVIDER_CANCELLED":
     case "PROVIDER_PROTOCOL_ERROR":
-    case "PROVIDER_EXECUTION_ERROR": {
+    case "PROVIDER_EXECUTION_ERROR":
+    case "PROVIDER_INFRASTRUCTURE_ERROR": {
       if (!provider) return undefined;
       const fields = {
         provider,
@@ -289,6 +297,9 @@ export function agentErrorFromPayload(payload: {
       }
       if (payload.code === "PROVIDER_PROTOCOL_ERROR") {
         return new AgentProviderProtocolError({ code: payload.code, ...fields });
+      }
+      if (payload.code === "PROVIDER_INFRASTRUCTURE_ERROR") {
+        return new AgentProviderInfrastructureError({ code: payload.code, ...fields });
       }
       return new AgentProviderExecutionError({ code: payload.code, ...fields });
     }
