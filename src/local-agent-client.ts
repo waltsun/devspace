@@ -23,6 +23,7 @@ import {
 import {
   decodeAgentRecord,
   decodeAgentRecordList,
+  decodeAgentWaitResult,
   decodeDaemonLogs,
   decodeDaemonStatus,
   decodeLocalAgentDaemonResponse,
@@ -47,9 +48,12 @@ import type {
   AgentListError,
   AgentLookupError,
   AgentStartError,
+  AgentWaitError,
+  AgentWaitResult,
   RunOverrides,
   StartLocalAgentInput,
 } from "./local-agent-manager.js";
+import { DEFAULT_AGENT_WAIT_TIMEOUT_MS } from "./local-agent-manager.js";
 import type { LocalAgentRecord, LocalAgentWorkspaceScope } from "./local-agent-store.js";
 
 const DEFAULT_STARTUP_TIMEOUT_MS = 8_000;
@@ -59,10 +63,11 @@ const RETRY_DELAY_MS = 40;
 type RequestError<M extends LocalAgentDaemonRequest["method"]> =
   M extends "agent.start" ? AgentStartError | AgentDaemonError
     : M extends "agent.continue" ? AgentContinueError | AgentDaemonError
-      : M extends "agent.cancel" ? AgentCancelError | AgentDaemonError
-        : M extends "agent.get" ? AgentLookupError | AgentDaemonError
-          : M extends "agent.list" ? AgentListError | AgentDaemonError
-            : AgentDaemonError;
+        : M extends "agent.cancel" ? AgentCancelError | AgentDaemonError
+          : M extends "agent.get" ? AgentLookupError | AgentDaemonError
+            : M extends "agent.wait" ? AgentWaitError | AgentDaemonError
+              : M extends "agent.list" ? AgentListError | AgentDaemonError
+                : AgentDaemonError;
 
 export interface LocalAgentClientOptions {
   stateDir: string;
@@ -135,6 +140,15 @@ export class LocalAgentClient {
   ): Promise<BetterResult<LocalAgentRecord, AgentLookupError | AgentDaemonError>> {
     const result = await this.request("agent.get", { id: agentId, scope });
     return decodeRequestResult(result, "agent.get", decodeAgentRecord);
+  }
+
+  async wait(
+    agentId: string,
+    scope: LocalAgentWorkspaceScope,
+    timeoutMs: number = DEFAULT_AGENT_WAIT_TIMEOUT_MS,
+  ): Promise<BetterResult<AgentWaitResult, AgentWaitError | AgentDaemonError>> {
+    const result = await this.request("agent.wait", { id: agentId, scope, timeoutMs });
+    return decodeRequestResult(result, "agent.wait", decodeAgentWaitResult);
   }
 
   async list(
@@ -650,6 +664,8 @@ function isRequestError(
         || category === "conflict"
         || category === "store";
     case "agent.get":
+      return category === "target" || category === "scope" || category === "store";
+    case "agent.wait":
       return category === "target" || category === "scope" || category === "store";
     case "agent.list":
       return category === "scope" || category === "store";

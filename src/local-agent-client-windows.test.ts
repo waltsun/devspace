@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LocalAgentClient } from "./local-agent-client.js";
 import { encodeLocalAgentDaemonResponse } from "./local-agent-daemon-protocol.js";
+import { LOCAL_AGENT_DAEMON_PROTOCOL_VERSION } from "./local-agent-daemon-lifecycle.js";
 
 const root = await mkdtemp(join(tmpdir(), "devspace-agent-host-client-test-"));
 try {
@@ -59,11 +60,11 @@ async function runHelloServer(root: string, windowsSessionId: number): Promise<{
       const request = JSON.parse(buffer.slice(0, newline)) as { requestId: string };
       socket.end(encodeLocalAgentDaemonResponse({
         requestId: request.requestId,
-        protocolVersion: 5,
+        protocolVersion: LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
         ok: true,
         result: {
           state: "ready",
-          protocolVersion: 5,
+          protocolVersion: LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
           pid: process.pid,
           host: {
             pid: process.pid,

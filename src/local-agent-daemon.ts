@@ -39,6 +39,8 @@ import type {
   AgentListError,
   AgentLookupError,
   AgentStartError,
+  AgentWaitError,
+  AgentWaitResult,
   RunOverrides,
   StartLocalAgentInput,
 } from "./local-agent-manager.js";
@@ -56,6 +58,7 @@ export interface LocalAgentDaemonManager {
   continue(agentId: string, prompt: string, overrides: RunOverrides | undefined, scope: LocalAgentWorkspaceScope): Promise<Result<LocalAgentRecord, AgentContinueError>>;
   cancel(agentId: string, scope: LocalAgentWorkspaceScope): Result<LocalAgentRecord, AgentCancelError>;
   get(agentId: string, scope: LocalAgentWorkspaceScope): Result<LocalAgentRecord, AgentLookupError>;
+  wait(agentId: string, scope: LocalAgentWorkspaceScope, timeoutMs: number): Promise<Result<AgentWaitResult, AgentWaitError>>;
   list(scope: LocalAgentWorkspaceScope): Result<LocalAgentRecord[], AgentListError>;
   evictIdle(now?: number): Promise<void>;
   close(): Promise<void>;
@@ -317,6 +320,12 @@ export class LocalAgentDaemon {
         return unwrapManagerResult(this.manager.cancel(request.params.id, request.params.scope));
       case "agent.get":
         return unwrapManagerResult(this.manager.get(request.params.id, request.params.scope));
+      case "agent.wait":
+        return unwrapManagerResult(await this.manager.wait(
+          request.params.id,
+          request.params.scope,
+          request.params.timeoutMs,
+        ));
       case "agent.list":
         return unwrapManagerResult(this.manager.list(request.params));
       case "daemon.status":

@@ -16,9 +16,14 @@ import {
 import {
   encodeLocalAgentDaemonResponse,
 } from "./local-agent-daemon-protocol.js";
-import { AgentConflictError } from "./local-agent-errors.js";
-import type { RunOverrides, StartLocalAgentInput } from "./local-agent-manager.js";
-import type { LocalAgentRecord } from "./local-agent-store.js";
+import { AgentConflictError, AgentScopeError, AgentTargetError } from "./local-agent-errors.js";
+import type {
+  AgentWaitError,
+  AgentWaitResult,
+  RunOverrides,
+  StartLocalAgentInput,
+} from "./local-agent-manager.js";
+import type { LocalAgentRecord, LocalAgentWorkspaceScope } from "./local-agent-store.js";
 
 const root = await mkdtemp(join(tmpdir(), "devspace-agentd-test-"));
 const record: LocalAgentRecord = {
@@ -40,6 +45,12 @@ class FakeManager implements LocalAgentDaemonManager {
   lastCancel?: { agentId: string; scope: { workspaceId?: string; workspaceRoot: string } };
   cancelCalls = 0;
   cancelError = false;
+  waitCalls: Array<{ agentId: string; scope: LocalAgentWorkspaceScope; timeoutMs: number }> = [];
+  waitRecordStatus: LocalAgentRecord["status"] = "idle";
+  waitTimedOut = false;
+  waitError?: AgentWaitError;
+  waitGate?: Promise<import("better-result").Result<AgentWaitResult, AgentWaitError>>;
+  resolveWait?: () => void;
 
   async start(input: StartLocalAgentInput) {
     this.lastInput = input;
@@ -72,6 +83,20 @@ class FakeManager implements LocalAgentDaemonManager {
 
   get(_id: string, _scope: { workspaceId: string; workspaceRoot: string }) {
     return Result.ok(record);
+  }
+
+  wait(
+    agentId: string,
+    scope: LocalAgentWorkspaceScope,
+    timeoutMs: number,
+  ): Promise<import("better-result").Result<AgentWaitResult, AgentWaitError>> {
+    this.waitCalls.push({ agentId, scope, timeoutMs });
+    if (this.waitGate) return this.waitGate;
+    if (this.waitError) return Promise.resolve(Result.err(this.waitError));
+    return Promise.resolve(Result.ok({
+      record: { ...record, status: this.waitRecordStatus },
+      timedOut: this.waitTimedOut,
+    }));
   }
 
   list(_scope: { workspaceId: string; workspaceRoot: string }) {
@@ -146,6 +171,59 @@ try {
   const recordScope = { workspaceId: record.workspaceId!, workspaceRoot: record.workspaceRoot };
   assert.equal(unwrap(await client.get(record.id, recordScope)).id, record.id);
   assert.equal(unwrap(await client.list(recordScope))[0]?.id, record.id);
+  const completedWait = unwrap(await client.wait(record.id, recordScope, 5_000));
+  assert.equal(completedWait.timedOut, false);
+  assert.equal(completedWait.record.status, "idle");
+  assert.deepEqual(manager.waitCalls.at(-1), {
+    agentId: record.id,
+    scope: recordScope,
+    timeoutMs: 5_000,
+  });
+  manager.waitRecordStatus = "running";
+  manager.waitTimedOut = true;
+  const timedOutWait = unwrap(await client.wait(record.id, recordScope));
+  assert.equal(timedOutWait.timedOut, true);
+  assert.equal(timedOutWait.record.status, "running");
+  assert.equal(manager.waitCalls.at(-1)?.timeoutMs, 20_000);
+  manager.waitRecordStatus = "idle";
+  manager.waitTimedOut = false;
+  const longPoll = new Promise<import("better-result").Result<AgentWaitResult, AgentWaitError>>((resolve) => {
+    manager.resolveWait = () => resolve(Result.ok({
+      record: { ...record, status: "idle", latestResponse: "completed by wait" },
+      timedOut: false,
+    }));
+  });
+  manager.waitGate = longPoll;
+  const pendingWait = client.wait(record.id, recordScope, 5_000);
+  await waitFor(() => manager.waitCalls.length >= 3);
+  assert.equal(unwrap(await client.status()).state, "ready");
+  manager.resolveWait?.();
+  const longPollResult = unwrap(await pendingWait);
+  assert.equal(longPollResult.timedOut, false);
+  assert.equal(longPollResult.record.latestResponse, "completed by wait");
+  manager.waitGate = undefined;
+  manager.resolveWait = undefined;
+  manager.waitError = new AgentTargetError({
+    code: "AGENT_NOT_FOUND",
+    target: record.id,
+    retryable: false,
+    message: "Unknown subagent id.",
+  });
+  const missingWait = await client.wait(record.id, recordScope, 5_000);
+  assert.equal(missingWait.isErr(), true);
+  if (missingWait.isErr()) assert.equal(missingWait.error.code, "AGENT_NOT_FOUND");
+  manager.waitError = new AgentScopeError({
+    code: "WORKSPACE_MISMATCH",
+    agentId: record.id,
+    workspaceId: recordScope.workspaceId,
+    operation: "wait",
+    retryable: false,
+    message: "Subagent belongs to a different workspace.",
+  });
+  const scopedWait = await client.wait(record.id, recordScope, 5_000);
+  assert.equal(scopedWait.isErr(), true);
+  if (scopedWait.isErr()) assert.equal(scopedWait.error.code, "WORKSPACE_MISMATCH");
+  manager.waitError = undefined;
   const cancelled = unwrap(await client.cancel(record.id, recordScope));
   assert.equal(cancelled.status, "running", "cancel returns an acknowledgement record immediately");
   assert.equal(manager.cancelCalls, 1);

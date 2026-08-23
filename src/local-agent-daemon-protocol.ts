@@ -4,10 +4,15 @@ import type {
   LocalAgentWorkspaceScope,
 } from "./local-agent-store.js";
 import type {
+  AgentWaitResult,
   RunOverrides,
   StartLocalAgentInput,
 } from "./local-agent-manager.js";
 import type { LocalAgentWriteMode } from "./local-agent-runtime.js";
+import {
+  DEFAULT_AGENT_WAIT_TIMEOUT_MS,
+  MAX_AGENT_WAIT_TIMEOUT_MS,
+} from "./local-agent-manager.js";
 import { LOCAL_AGENT_DAEMON_PROTOCOL_VERSION } from "./local-agent-daemon-lifecycle.js";
 
 export type LocalAgentDaemonMethod =
@@ -16,6 +21,7 @@ export type LocalAgentDaemonMethod =
   | "agent.continue"
   | "agent.get"
   | "agent.cancel"
+  | "agent.wait"
   | "agent.list"
   | "daemon.status"
   | "daemon.stop"
@@ -27,6 +33,7 @@ export type LocalAgentDaemonRequest =
   | AgentDaemonRequestBase<"agent.continue", { id: string; prompt: string; scope: LocalAgentWorkspaceScope; overrides?: RunOverrides }>
   | AgentDaemonRequestBase<"agent.get", { id: string; scope: LocalAgentWorkspaceScope }>
   | AgentDaemonRequestBase<"agent.cancel", { id: string; scope: LocalAgentWorkspaceScope }>
+  | AgentDaemonRequestBase<"agent.wait", { id: string; scope: LocalAgentWorkspaceScope; timeoutMs: number }>
   | AgentDaemonRequestBase<"agent.list", LocalAgentWorkspaceScope>
   | AgentDaemonRequestBase<"daemon.status", Record<string, never>>
   | AgentDaemonRequestBase<"daemon.stop", Record<string, never>>
@@ -132,6 +139,19 @@ export function decodeLocalAgentDaemonRequest(value: unknown): LocalAgentDaemonR
         authToken,
         params: decodeAgentScopedIdParams(params),
       } as LocalAgentDaemonRequest;
+    case "agent.wait": {
+      const record = asRecord(params);
+      return {
+        requestId,
+        protocolVersion,
+        method,
+        authToken,
+        params: {
+          ...decodeAgentScopedIdParams(params),
+          timeoutMs: decodeWaitTimeoutMs(record?.timeoutMs),
+        },
+      } as LocalAgentDaemonRequest;
+    }
     case "agent.list":
       return {
         requestId,
@@ -316,6 +336,14 @@ function decodeListScope(value: unknown): LocalAgentWorkspaceScope {
   return decodeWorkspaceScope(value);
 }
 
+export function decodeAgentWaitResult(value: unknown): AgentWaitResult {
+  const record = asRecord(value);
+  return {
+    record: decodeAgentRecord(record?.record),
+    timedOut: requiredBoolean(record?.timedOut, "timedOut"),
+  };
+}
+
 function decodeAgentScopedIdParams(value: unknown): {
   id: string;
   scope: LocalAgentWorkspaceScope;
@@ -325,6 +353,18 @@ function decodeAgentScopedIdParams(value: unknown): {
     id: requiredString(record?.id, "id"),
     scope: decodeWorkspaceScope(record?.scope),
   };
+}
+
+function decodeWaitTimeoutMs(value: unknown): number {
+  if (value === undefined) return DEFAULT_AGENT_WAIT_TIMEOUT_MS;
+  if (typeof value !== "number" || !Number.isSafeInteger(value)
+    || value < 1 || value > MAX_AGENT_WAIT_TIMEOUT_MS) {
+    throw new LocalAgentDaemonProtocolError(
+      "INVALID_PARAMS",
+      `Wait timeoutMs must be an integer between 1 and ${MAX_AGENT_WAIT_TIMEOUT_MS}.`,
+    );
+  }
+  return value;
 }
 
 function decodeLogsParams(value: unknown): { lines?: number } {

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   decodeAgentRecord,
+  decodeAgentWaitResult,
   decodeLocalAgentDaemonRequest,
   decodeLocalAgentDaemonResponse,
   encodeLocalAgentDaemonRequest,
@@ -9,7 +10,7 @@ import {
 } from "./local-agent-daemon-protocol.js";
 import { LOCAL_AGENT_DAEMON_PROTOCOL_VERSION } from "./local-agent-daemon-lifecycle.js";
 
-assert.equal(LOCAL_AGENT_DAEMON_PROTOCOL_VERSION, 5);
+assert.equal(LOCAL_AGENT_DAEMON_PROTOCOL_VERSION, 6);
 
 const request = decodeLocalAgentDaemonRequest({
   requestId: "req_1",
@@ -128,6 +129,46 @@ assert.equal(cancelRequest.method, "agent.cancel");
 if (cancelRequest.method !== "agent.cancel") throw new Error("expected agent.cancel request");
 assert.deepEqual(cancelRequest.params, { id: "agt_test", scope: cancelScope });
 
+const waitRequest = decodeLocalAgentDaemonRequest({
+  requestId: "req_wait_default",
+  protocolVersion: LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
+  authToken: "test-secret",
+  method: "agent.wait",
+  params: { id: "agt_test", scope: cancelScope },
+});
+assert.equal(waitRequest.method, "agent.wait");
+if (waitRequest.method !== "agent.wait") throw new Error("expected agent.wait request");
+assert.deepEqual(waitRequest.params, {
+  id: "agt_test",
+  scope: cancelScope,
+  timeoutMs: 20_000,
+});
+
+for (const timeoutMs of [1, 1_000, 19_999, 20_000]) {
+  const customWaitRequest = decodeLocalAgentDaemonRequest({
+    requestId: `req_wait_${timeoutMs}`,
+    protocolVersion: LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
+    authToken: "test-secret",
+    method: "agent.wait",
+    params: { id: "agt_test", scope: cancelScope, timeoutMs },
+  });
+  if (customWaitRequest.method !== "agent.wait") throw new Error("expected agent.wait request");
+  assert.equal(customWaitRequest.params.timeoutMs, timeoutMs);
+}
+
+for (const timeoutMs of [0, -1, 20_001, 1.5, "1000", null]) {
+  assert.throws(
+    () => decodeLocalAgentDaemonRequest({
+      requestId: "req_wait_invalid",
+      protocolVersion: LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
+      authToken: "test-secret",
+      method: "agent.wait",
+      params: { id: "agt_test", scope: cancelScope, timeoutMs },
+    }),
+    (error: unknown) => error instanceof LocalAgentDaemonProtocolError && error.code === "INVALID_PARAMS",
+  );
+}
+
 for (const params of [
   {},
   { id: "agt_test" },
@@ -163,3 +204,16 @@ const failedRecord = decodeAgentRecord({
 });
 assert.equal(failedRecord.errorCode, "DAEMON_TIMEOUT");
 assert.equal(failedRecord.errorRetryable, true);
+
+const waitResult = decodeAgentWaitResult({ record, timedOut: true });
+assert.equal(waitResult.record.id, record.id);
+assert.equal(waitResult.timedOut, true);
+for (const value of [
+  {},
+  { record, },
+  { timedOut: false },
+  { record, timedOut: "true" },
+  { record: { ...record, status: "invalid" }, timedOut: false },
+]) {
+  assert.throws(() => decodeAgentWaitResult(value));
+}

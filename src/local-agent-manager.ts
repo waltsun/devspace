@@ -67,11 +67,19 @@ export interface LocalAgentManagerOptions {
   subagents: SubagentsConfig;
 }
 
+export const DEFAULT_AGENT_WAIT_TIMEOUT_MS = 20_000;
+export const MAX_AGENT_WAIT_TIMEOUT_MS = 20_000;
+
 export type AgentStartError = AgentTargetError | AgentScopeError | AgentConflictError | AgentStoreError;
 export type AgentContinueError = AgentStartError;
 export type AgentLookupError = AgentTargetError | AgentScopeError | AgentStoreError;
 export type AgentListError = AgentScopeError | AgentStoreError;
 export type AgentCancelError = AgentTargetError | AgentScopeError | AgentConflictError | AgentStoreError;
+export interface AgentWaitResult {
+  record: LocalAgentRecord;
+  timedOut: boolean;
+}
+export type AgentWaitError = AgentLookupError;
 
 interface ActiveLocalAgentTurn {
   promise: Promise<void>;
@@ -212,6 +220,36 @@ export class LocalAgentManager {
       providerSessionIdPrefix: record.providerSessionId?.slice(0, 8),
     });
     return Result.ok(record);
+  }
+
+  async wait(
+    agentId: string,
+    scope: LocalAgentWorkspaceScope,
+    timeoutMs: number = DEFAULT_AGENT_WAIT_TIMEOUT_MS,
+  ): Promise<BetterResult<AgentWaitResult, AgentWaitError>> {
+    assertAgentWaitTimeout(timeoutMs);
+    const lookup = this.store.getByIdResult(agentId);
+    if (lookup.isErr()) return lookup;
+    const record = lookup.value;
+    if (!record) return Result.err(agentNotFound(agentId));
+    const scoped = this.agentWorkspaceResult(record, scope, "wait");
+    if (scoped.isErr()) return scoped;
+
+    const active = this.activeTurns.get(agentId);
+    if (!active) return Result.ok({ record, timedOut: false });
+
+    const settled = await waitForTurnSettlement(active.promise, timeoutMs);
+    const refreshed = this.store.getByIdResult(agentId);
+    if (refreshed.isErr()) return refreshed;
+    if (!refreshed.value) return Result.err(agentNotFound(agentId));
+
+    const sameTurnStillActive = this.activeTurns.get(agentId) === active;
+    const recordStillRunning = refreshed.value.status === "starting"
+      || refreshed.value.status === "running";
+    return Result.ok({
+      record: refreshed.value,
+      timedOut: !settled && sameTurnStillActive && recordStillRunning,
+    });
   }
 
   get(
@@ -684,4 +722,26 @@ function agentNotFound(agentId: string): AgentTargetError {
     retryable: false,
     message: `Unknown subagent id: ${agentId}.`,
   });
+}
+
+function assertAgentWaitTimeout(timeoutMs: number): void {
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_AGENT_WAIT_TIMEOUT_MS) {
+    throw new RangeError(`Agent wait timeoutMs must be an integer between 1 and ${MAX_AGENT_WAIT_TIMEOUT_MS}.`);
+  }
+}
+
+async function waitForTurnSettlement(promise: Promise<void>, timeoutMs: number): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), timeoutMs);
+    timer.unref();
+  });
+  try {
+    return await Promise.race([
+      promise.then(() => true, () => true),
+      timeout,
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }

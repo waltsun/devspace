@@ -300,6 +300,12 @@ runtimes.get(first.id)!.release();
 await waitFor(() => getRecord(first.id).status === "idle");
 assert.equal(getRecord(first.id).providerSessionId, "thread_test");
 assert.match(getRecord(first.id).latestResponse ?? "", /Task:\nhold/);
+const alreadyTerminal = await manager.wait(first.id, scope, 1_000);
+assert.equal(alreadyTerminal.isOk(), true);
+if (alreadyTerminal.isOk()) {
+  assert.equal(alreadyTerminal.value.timedOut, false);
+  assert.equal(alreadyTerminal.value.record.status, "idle");
+}
 
 const continued = unwrap(await manager.continue(first.id, "continue", {
   model: "gpt-run",
@@ -320,13 +326,60 @@ await waitFor(() => getRecord(second.id).status === "idle");
 assert.notEqual(first.id, second.id);
 assert.equal(runtimes.size, 2, "different agents receive independent logical runtimes");
 
+const waitSuccess = unwrap(await manager.start({
+  target: "reviewer",
+  prompt: "wait-success-hold",
+  workspaceId: scope.workspaceId,
+  workspaceRoot: root,
+}));
+await waitFor(() => runtimes.get(waitSuccess.id)?.inputs.length === 1);
+const waitSuccessOne = manager.wait(waitSuccess.id, scope, 1_000);
+const waitSuccessTwo = manager.wait(waitSuccess.id, scope, 1_000);
+runtimes.get(waitSuccess.id)!.release();
+const [waitSuccessResultOne, waitSuccessResultTwo] = await Promise.all([waitSuccessOne, waitSuccessTwo]);
+for (const result of [waitSuccessResultOne, waitSuccessResultTwo]) {
+  assert.equal(result.isOk(), true);
+  if (result.isOk()) {
+    assert.equal(result.value.timedOut, false);
+    assert.equal(result.value.record.status, "idle");
+    assert.match(result.value.record.latestResponse ?? "", /wait-success-hold/);
+  }
+}
+
+const waitTimeout = unwrap(await manager.start({
+  target: "reviewer",
+  prompt: "wait-timeout-hold",
+  workspaceId: scope.workspaceId,
+  workspaceRoot: root,
+}));
+await waitFor(() => runtimes.get(waitTimeout.id)?.inputs.length === 1);
+const timeoutTestKeepAlive = setInterval(() => undefined, 1);
+const waitTimeoutResult = await manager.wait(waitTimeout.id, scope, 10);
+clearInterval(timeoutTestKeepAlive);
+assert.equal(waitTimeoutResult.isOk(), true);
+if (waitTimeoutResult.isOk()) {
+  assert.equal(waitTimeoutResult.value.timedOut, true);
+  assert.equal(waitTimeoutResult.value.record.status, "running");
+}
+assert.equal(runtimes.get(waitTimeout.id)!.controls[0]?.signal?.aborted, false);
+runtimes.get(waitTimeout.id)!.release();
+await waitFor(() => getRecord(waitTimeout.id).status === "idle");
+
 const failed = unwrap(await manager.start({
   target: "reviewer",
   prompt: "fail",
   workspaceId: scope.workspaceId,
   workspaceRoot: root,
 }));
+const failedWait = manager.wait(failed.id, scope, 1_000);
 await waitFor(() => getRecord(failed.id).status === "error");
+const failedWaitResult = await failedWait;
+assert.equal(failedWaitResult.isOk(), true);
+if (failedWaitResult.isOk()) {
+  assert.equal(failedWaitResult.value.timedOut, false);
+  assert.equal(failedWaitResult.value.record.status, "error");
+  assert.equal(failedWaitResult.value.record.errorCode, "PROVIDER_EXECUTION_ERROR");
+}
 assert.equal(getRecord(failed.id).error, "provider failed");
 assert.equal(getRecord(failed.id).errorCode, "PROVIDER_EXECUTION_ERROR");
 assert.equal(getRecord(failed.id).errorRetryable, false);
@@ -343,6 +396,13 @@ const cancellable = unwrap(await manager.start({
 await waitFor(() => runtimes.get(cancellable.id)?.inputs.length === 1);
 const cancellableRuntime = runtimes.get(cancellable.id)!;
 assert.equal(cancellableRuntime.controls[0]?.signal?.aborted, false);
+const wrongWaitScope = await manager.wait(cancellable.id, {
+  workspaceId: scope.workspaceId,
+  workspaceRoot: join(root, "other"),
+}, 1_000);
+assert.equal(wrongWaitScope.isErr(), true);
+if (wrongWaitScope.isErr()) assert.equal(wrongWaitScope.error.code, "WORKSPACE_MISMATCH");
+assert.equal(cancellableRuntime.controls[0]?.signal?.aborted, false);
 const wrongCancelScope = manager.cancel(cancellable.id, {
   workspaceId: scope.workspaceId,
   workspaceRoot: join(root, "other"),
@@ -355,6 +415,7 @@ const cancelRequest = manager.cancel(cancellable.id, scope);
 assert.equal(cancelRequest.isOk(), true);
 if (cancelRequest.isOk()) assert.equal(cancelRequest.value.status, "running");
 assert.equal(getRecord(cancellable.id).status, "running");
+const waitCancellation = manager.wait(cancellable.id, scope, 1_000);
 const repeatedCancel = manager.cancel(cancellable.id, scope);
 assert.equal(repeatedCancel.isOk(), true);
 assert.equal(cancellableRuntime.controls[0]?.signal?.aborted, true);
@@ -365,6 +426,12 @@ if (continueWhileCancelling.isErr()) assert.equal(continueWhileCancelling.error.
 assert.equal(getRecord(cancellable.id).status, "running");
 cancellableRuntime.release();
 await waitFor(() => getRecord(cancellable.id).status === "stopped");
+const waitCancellationResult = await waitCancellation;
+assert.equal(waitCancellationResult.isOk(), true);
+if (waitCancellationResult.isOk()) {
+  assert.equal(waitCancellationResult.value.timedOut, false);
+  assert.equal(waitCancellationResult.value.record.status, "stopped");
+}
 assert.equal(getRecord(cancellable.id).latestResponse, undefined);
 assert.equal(getRecord(cancellable.id).error, undefined);
 assert.equal(getRecord(cancellable.id).errorCode, undefined);
@@ -433,6 +500,9 @@ assert.equal(runtimes.get(immediate.id)?.immediateWorkStarted ?? false, false, "
 const missingCancel = manager.cancel("agt_missing", scope);
 assert.equal(missingCancel.isErr(), true);
 if (missingCancel.isErr()) assert.equal(missingCancel.error.code, "AGENT_NOT_FOUND");
+const missingWait = await manager.wait("agt_missing", scope, 1_000);
+assert.equal(missingWait.isErr(), true);
+if (missingWait.isErr()) assert.equal(missingWait.error.code, "AGENT_NOT_FOUND");
 
 const earlyFailure = unwrap(await manager.start({
   target: "reviewer",
@@ -490,7 +560,15 @@ const defect = unwrap(await manager.start({
   workspaceId: scope.workspaceId,
   workspaceRoot: root,
 }));
+const defectWait = manager.wait(defect.id, scope, 1_000);
 await waitFor(() => getRecord(defect.id).status === "error");
+const defectWaitResult = await defectWait;
+assert.equal(defectWaitResult.isOk(), true);
+if (defectWaitResult.isOk()) {
+  assert.equal(defectWaitResult.value.timedOut, false);
+  assert.equal(defectWaitResult.value.record.status, "error");
+  assert.equal(defectWaitResult.value.record.errorCode, "AGENT_INTERNAL_ERROR");
+}
 assert.equal(getRecord(defect.id).errorCode, "AGENT_INTERNAL_ERROR");
 assert.notEqual(getRecord(defect.id).errorCode, "PROVIDER_EXECUTION_ERROR");
 
