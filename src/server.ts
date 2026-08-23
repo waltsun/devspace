@@ -102,6 +102,18 @@ const AGENT_START_ANNOTATIONS = {
   idempotentHint: false,
   openWorldHint: true,
 };
+const AGENT_CONTINUE_ANNOTATIONS = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
+  openWorldHint: true,
+};
+const AGENT_CANCEL_ANNOTATIONS = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
+  openWorldHint: false,
+};
 const AGENT_WAIT_ANNOTATIONS = {
   readOnlyHint: true,
   destructiveHint: false,
@@ -220,7 +232,7 @@ function serverInstructions(config: ServerConfig): string {
       ? " If the turn successfully modifies files by creating, editing, overwriting, deleting, moving, or applying patches, call show_changes exactly once for that workspace after the final related file change and before your final response so the user can inspect the aggregate diff for that turn. Do not call it after every individual file change; do not skip it because individual file-change tools already returned diffs."
       : "";
   const subagentInstruction = config.subagents.enabled
-    ? " When a suitable local coding agent is available and delegation is useful, use agent_start with the current workspaceId. agent_start returns immediately. Use agent_wait to wait for the current turn; a wait timeout does not stop the agent, so call agent_wait again if continued waiting is appropriate."
+    ? " When a suitable local coding agent is available and delegation is useful, use agent_start with the current workspaceId. agent_start returns immediately. Use agent_wait to wait for the current turn. Use agent_continue to start another turn on an existing agent after its previous turn is no longer active. Use agent_cancel when an active turn should be interrupted; cancellation is asynchronous, so use agent_wait afterward to observe the result. A wait timeout does not stop the agent."
     : "";
 
   if (config.toolMode === "codex") {
@@ -276,7 +288,10 @@ function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
   };
 }
 
-export type LocalAgentMcpClient = Pick<LocalAgentClient, "start" | "wait">;
+export type LocalAgentMcpClient = Pick<
+  LocalAgentClient,
+  "start" | "wait" | "continue" | "cancel"
+>;
 
 function agentOutputSchema(): z.ZodRawShape {
   return {
@@ -300,10 +315,23 @@ function agentStartOutputSchema(): z.ZodRawShape {
   });
 }
 
+function agentContinueOutputSchema(): z.ZodRawShape {
+  return resultOutputSchema({
+    agent: z.object(agentOutputSchema()),
+  });
+}
+
 function agentWaitOutputSchema(): z.ZodRawShape {
   return resultOutputSchema({
     agent: z.object(agentOutputSchema()),
     timedOut: z.boolean(),
+  });
+}
+
+function agentCancelOutputSchema(): z.ZodRawShape {
+  return resultOutputSchema({
+    agent: z.object(agentOutputSchema()),
+    cancelRequested: z.boolean(),
   });
 }
 
@@ -911,6 +939,120 @@ function registerLocalAgentTools(
           result,
           agent,
           timedOut: response.value.timedOut,
+        },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "agent_continue",
+    {
+      title: "Continue agent",
+      description:
+        "Start another turn on an existing durable local coding agent. The call returns immediately after the new turn is started and does not wait for completion. Use agent_wait to wait for the current turn.",
+      inputSchema: {
+        workspaceId: z.string().describe(workspaceIdDescription),
+        agentId: z.string().min(1).describe("Durable agent identifier returned by agent_start."),
+        prompt: z.string().min(1).describe("Prompt for the next coding-agent turn."),
+        model: z.string().optional().describe("Optional provider model override."),
+        effort: z.string().optional().describe("Optional provider effort override."),
+        writeMode: z
+          .enum(["read_only", "allowed", "full_access"])
+          .optional()
+          .describe("Optional workspace write policy override."),
+      },
+      outputSchema: agentContinueOutputSchema(),
+      _meta: {},
+      annotations: AGENT_CONTINUE_ANNOTATIONS,
+    },
+    async ({ workspaceId, agentId, prompt, model, effort, writeMode }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const scope = {
+        workspaceId: workspace.id,
+        workspaceRoot: workspace.root,
+      };
+      const overrides = {
+        ...(model !== undefined ? { model } : {}),
+        ...(effort !== undefined ? { effort } : {}),
+        ...(writeMode !== undefined ? { writeMode } : {}),
+      };
+      const response = await client.continue(agentId, prompt, overrides, scope);
+
+      if (response.isErr()) {
+        const errorResponse = agentErrorResponse(response.error);
+        logFailedToolResponse(config, {
+          tool: "agent_continue",
+          workspaceId,
+        }, errorResponse.content, startedAt);
+        return errorResponse;
+      }
+
+      const agent = agentOutput(response.value);
+      const result = `Continued agent ${agent.id}; status: ${agent.status}.`;
+      const content = [textBlock(result)];
+      logToolCall(config, {
+        tool: "agent_continue",
+        workspaceId,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        content,
+        structuredContent: { result, agent },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "agent_cancel",
+    {
+      title: "Cancel agent turn",
+      description:
+        "Request cancellation of the active turn on an existing local coding agent. Cancellation is asynchronous: a successful call means the request was accepted, not that the turn has already stopped. Use agent_wait to observe the resulting state.",
+      inputSchema: {
+        workspaceId: z.string().describe(workspaceIdDescription),
+        agentId: z.string().min(1).describe("Durable agent identifier returned by agent_start."),
+      },
+      outputSchema: agentCancelOutputSchema(),
+      _meta: {},
+      annotations: AGENT_CANCEL_ANNOTATIONS,
+    },
+    async ({ workspaceId, agentId }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const scope = {
+        workspaceId: workspace.id,
+        workspaceRoot: workspace.root,
+      };
+      const response = await client.cancel(agentId, scope);
+
+      if (response.isErr()) {
+        const errorResponse = agentErrorResponse(response.error);
+        logFailedToolResponse(config, {
+          tool: "agent_cancel",
+          workspaceId,
+        }, errorResponse.content, startedAt);
+        return errorResponse;
+      }
+
+      const agent = agentOutput(response.value);
+      const result = `Cancellation requested for agent ${agent.id}; current status: ${agent.status}.`;
+      const content = [textBlock(result)];
+      logToolCall(config, {
+        tool: "agent_cancel",
+        workspaceId,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        content,
+        structuredContent: {
+          result,
+          agent,
+          cancelRequested: true,
         },
       };
     },

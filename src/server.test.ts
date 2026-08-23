@@ -12,7 +12,7 @@ import { loadConfig, type ServerConfig } from "./config.js";
 import type { LocalAgentProviderAvailability } from "./local-agent-availability.js";
 import { buildLocalAgentProviderStatuses } from "./local-agent-catalog.js";
 import type { SubagentsConfig } from "./local-agent-config.js";
-import { AgentTargetError } from "./local-agent-errors.js";
+import { AgentConflictError, AgentTargetError } from "./local-agent-errors.js";
 import type { LocalAgentRecord } from "./local-agent-store.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { ProcessSessionManager } from "./process-sessions.js";
@@ -27,6 +27,8 @@ test("agent controller tools are exposed only when subagents are enabled", async
   const disabledTools = (await disabled.client.listTools()).tools;
   assert.equal(disabledTools.some((tool) => tool.name === "agent_start"), false);
   assert.equal(disabledTools.some((tool) => tool.name === "agent_wait"), false);
+  assert.equal(disabledTools.some((tool) => tool.name === "agent_continue"), false);
+  assert.equal(disabledTools.some((tool) => tool.name === "agent_cancel"), false);
 
   const enabled = await fixture(t, {
     localAgentProviders: [{ name: "codex", available: true }],
@@ -34,8 +36,12 @@ test("agent controller tools are exposed only when subagents are enabled", async
   const enabledTools = (await enabled.client.listTools()).tools;
   const startTool = enabledTools.find((tool) => tool.name === "agent_start");
   const waitTool = enabledTools.find((tool) => tool.name === "agent_wait");
+  const continueTool = enabledTools.find((tool) => tool.name === "agent_continue");
+  const cancelTool = enabledTools.find((tool) => tool.name === "agent_cancel");
   assert.ok(startTool);
   assert.ok(waitTool);
+  assert.ok(continueTool);
+  assert.ok(cancelTool);
   assert.deepEqual(startTool.annotations, {
     readOnlyHint: false,
     destructiveHint: true,
@@ -48,8 +54,22 @@ test("agent controller tools are exposed only when subagents are enabled", async
     idempotentHint: true,
     openWorldHint: false,
   });
+  assert.deepEqual(continueTool.annotations, {
+    readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: false,
+    openWorldHint: true,
+  });
+  assert.deepEqual(cancelTool.annotations, {
+    readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: false,
+    openWorldHint: false,
+  });
   assert.deepEqual(startTool._meta, {});
   assert.deepEqual(waitTool._meta, {});
+  assert.deepEqual(continueTool._meta, {});
+  assert.deepEqual(cancelTool._meta, {});
 });
 
 test("agent_start resolves the workspace and returns without waiting", async (t) => {
@@ -64,7 +84,7 @@ test("agent_start resolves the workspace and returns without waiting", async (t)
     effort: "high",
     providerSessionId: "provider-session-1",
   });
-  const localAgentClient: LocalAgentMcpClient = {
+  const localAgentClient = makeLocalAgentMcpClient({
     start: async (input) => {
       startInput = input;
       return Result.ok(record);
@@ -73,7 +93,7 @@ test("agent_start resolves the workspace and returns without waiting", async (t)
       waitCalled = true;
       return Result.ok({ record, timedOut: false });
     },
-  };
+  });
   const context = await fixture(t, {
     localAgentProviders: [{ name: "codex", available: true }],
     localAgentClient,
@@ -122,13 +142,13 @@ test("agent_wait forwards the resolved workspace scope and returns a completed t
     status: "idle",
     latestResponse: "done",
   });
-  const localAgentClient: LocalAgentMcpClient = {
+  const localAgentClient = makeLocalAgentMcpClient({
     start: async () => Result.ok(record),
     wait: async (agentId, scope, timeoutMs) => {
       waitInput = { agentId, scope, timeoutMs };
       return Result.ok({ record, timedOut: false });
     },
-  };
+  });
   const context = await fixture(t, {
     localAgentProviders: [{ name: "codex", available: true }],
     localAgentClient,
@@ -158,13 +178,13 @@ test("agent_wait forwards the resolved workspace scope and returns a completed t
 
 test("agent_wait reports a bounded timeout without stopping the agent", async (t) => {
   const record = makeAgentRecord({ id: "agt_wait_timeout", status: "running" });
-  const localAgentClient: LocalAgentMcpClient = {
+  const localAgentClient = makeLocalAgentMcpClient({
     start: async () => Result.ok(record),
     wait: async (_agentId, _scope, timeoutMs) => {
       assert.equal(timeoutMs, 1_000);
       return Result.ok({ record, timedOut: true });
     },
-  };
+  });
   const context = await fixture(t, {
     localAgentProviders: [{ name: "codex", available: true }],
     localAgentClient,
@@ -184,6 +204,263 @@ test("agent_wait reports a bounded timeout without stopping the agent", async (t
   assert.doesNotMatch(responseText(response), /stop/i);
 });
 
+test("agent_continue forwards the workspace scope and overrides without waiting", async (t) => {
+  let continueInput: unknown;
+  let waitCalled = false;
+  const record = makeAgentRecord({
+    id: "agt_continue_test",
+    profileName: "codex-luna",
+    provider: "codex",
+    status: "running",
+    model: "gpt-test",
+    effort: "high",
+    providerSessionId: "thread_xyz",
+  });
+  const localAgentClient = makeLocalAgentMcpClient({
+    continue: async (agentId, prompt, overrides, scope) => {
+      continueInput = { agentId, prompt, overrides, scope };
+      return Result.ok(record);
+    },
+    wait: async () => {
+      waitCalled = true;
+      return Result.ok({ record, timedOut: false });
+    },
+  });
+  const context = await fixture(t, {
+    localAgentProviders: [{ name: "codex", available: true }],
+    localAgentClient,
+  });
+
+  const opened = structuredContent(await callOpen(context.client, context.project));
+  const response = await callAgentContinue(context.client, {
+    workspaceId: opened.workspaceId,
+    agentId: record.id,
+    prompt: "  preserve\nthis exactly  ",
+    model: "gpt-test",
+    effort: "high",
+    writeMode: "allowed",
+  });
+
+  assert.deepEqual(continueInput, {
+    agentId: record.id,
+    prompt: "  preserve\nthis exactly  ",
+    overrides: {
+      model: "gpt-test",
+      effort: "high",
+      writeMode: "allowed",
+    },
+    scope: {
+      workspaceId: opened.workspaceId,
+      workspaceRoot: opened.root,
+    },
+  });
+  assert.equal(waitCalled, false);
+
+  const structured = structuredContent(response);
+  const agent = structured.agent as Record<string, unknown>;
+  assert.equal(agent.id, record.id);
+  assert.equal(agent.target, "codex-luna");
+  assert.equal(agent.provider, "codex");
+  assert.equal(agent.status, "running");
+  assert.equal(agent.providerSessionId, "thread_xyz");
+  assert.match(responseText(response), /Continued agent agt_continue_test; status: running\./);
+  assert.doesNotMatch(responseText(response), /completed|succeeded|finished/i);
+});
+
+test("agent_continue preserves whitespace, sends clean empty overrides, and rejects an empty prompt", async (t) => {
+  let continueCalls = 0;
+  let receivedPrompt: string | undefined;
+  let receivedOverrides: unknown;
+  const record = makeAgentRecord({ id: "agt_continue_prompt" });
+  const localAgentClient = makeLocalAgentMcpClient({
+    continue: async (_agentId, prompt, overrides) => {
+      continueCalls += 1;
+      receivedPrompt = prompt;
+      receivedOverrides = overrides;
+      return Result.ok(record);
+    },
+  });
+  const context = await fixture(t, {
+    localAgentProviders: [{ name: "codex", available: true }],
+    localAgentClient,
+  });
+  const opened = structuredContent(await callOpen(context.client, context.project));
+
+  const response = await callAgentContinue(context.client, {
+    workspaceId: opened.workspaceId,
+    agentId: record.id,
+    prompt: "  preserve\nthis exactly  ",
+  });
+  assert.equal(response.isError, undefined);
+  assert.equal(receivedPrompt, "  preserve\nthis exactly  ");
+  assert.deepEqual(receivedOverrides, {});
+  assert.equal(continueCalls, 1);
+
+  const invalid = await callAgentContinue(context.client, {
+    workspaceId: opened.workspaceId,
+    agentId: record.id,
+    prompt: "",
+  });
+  assert.equal(invalid.isError, true);
+  assert.match(responseText(invalid), /prompt/);
+  assert.equal(continueCalls, 1);
+});
+
+test("agent_continue preserves conflict errors without waiting, cancelling, or retrying", async (t) => {
+  const error = new AgentConflictError({
+    code: "AGENT_CONFLICT",
+    agentId: "agt_continue_conflict",
+    operation: "continue",
+    retryable: false,
+    message: "Agent agt_continue_conflict already has a running turn.",
+  });
+  let waitCalled = false;
+  let cancelCalled = false;
+  const localAgentClient = makeLocalAgentMcpClient({
+    continue: async () => Result.err(error),
+    wait: async () => {
+      waitCalled = true;
+      return Result.ok({ record: makeAgentRecord(), timedOut: false });
+    },
+    cancel: async () => {
+      cancelCalled = true;
+      return Result.err(error);
+    },
+  });
+  const context = await fixture(t, {
+    localAgentProviders: [{ name: "codex", available: true }],
+    localAgentClient,
+  });
+  const opened = structuredContent(await callOpen(context.client, context.project));
+
+  const response = await callAgentContinue(context.client, {
+    workspaceId: opened.workspaceId,
+    agentId: error.agentId!,
+    prompt: "try another turn",
+  });
+  assert.equal(response.isError, true);
+  assert.match(responseText(response), /AGENT_CONFLICT/);
+  assert.match(responseText(response), /already has a running turn/);
+  const structured = structuredContent(response);
+  assert.equal(structured.errorCode, "AGENT_CONFLICT");
+  assert.equal(structured.error, error.message);
+  assert.equal(structured.errorRetryable, false);
+  assert.equal(waitCalled, false);
+  assert.equal(cancelCalled, false);
+});
+
+test("agent_cancel forwards the workspace scope and reports an asynchronous request", async (t) => {
+  let cancelInput: unknown;
+  let waitCalled = false;
+  const record = makeAgentRecord({
+    id: "agt_cancel_test",
+    profileName: "codex-luna",
+    provider: "codex",
+    status: "running",
+    providerSessionId: "thread_cancel",
+  });
+  const localAgentClient = makeLocalAgentMcpClient({
+    cancel: async (agentId, scope) => {
+      cancelInput = { agentId, scope };
+      return Result.ok(record);
+    },
+    wait: async () => {
+      waitCalled = true;
+      return Result.ok({ record, timedOut: false });
+    },
+  });
+  const context = await fixture(t, {
+    localAgentProviders: [{ name: "codex", available: true }],
+    localAgentClient,
+  });
+  const opened = structuredContent(await callOpen(context.client, context.project));
+
+  const response = await callAgentCancel(context.client, {
+    workspaceId: opened.workspaceId,
+    agentId: record.id,
+  });
+
+  assert.deepEqual(cancelInput, {
+    agentId: record.id,
+    scope: {
+      workspaceId: opened.workspaceId,
+      workspaceRoot: opened.root,
+    },
+  });
+  assert.equal(waitCalled, false);
+  const structured = structuredContent(response);
+  assert.equal(structured.cancelRequested, true);
+  assert.equal((structured.agent as Record<string, unknown>).status, "running");
+  assert.match(responseText(response), /Cancellation requested for agent agt_cancel_test; current status: running\./);
+  assert.doesNotMatch(responseText(response), /cancelled|canceled|stopped|completed/i);
+});
+
+test("agent_cancel preserves conflict errors when no active turn exists", async (t) => {
+  const error = new AgentConflictError({
+    code: "AGENT_CONFLICT",
+    agentId: "agt_cancel_conflict",
+    operation: "cancel",
+    retryable: false,
+    message: "Agent agt_cancel_conflict has no active turn to cancel.",
+  });
+  const localAgentClient = makeLocalAgentMcpClient({
+    cancel: async () => Result.err(error),
+  });
+  const context = await fixture(t, {
+    localAgentProviders: [{ name: "codex", available: true }],
+    localAgentClient,
+  });
+  const opened = structuredContent(await callOpen(context.client, context.project));
+
+  const response = await callAgentCancel(context.client, {
+    workspaceId: opened.workspaceId,
+    agentId: error.agentId!,
+  });
+  assert.equal(response.isError, true);
+  assert.match(responseText(response), /AGENT_CONFLICT/);
+  assert.match(responseText(response), /has no active turn to cancel/);
+  const structured = structuredContent(response);
+  assert.equal(structured.errorCode, "AGENT_CONFLICT");
+  assert.equal(structured.error, error.message);
+  assert.equal(structured.errorRetryable, false);
+});
+
+test("agent_continue and agent_cancel reject unknown workspaces before calling the client", async (t) => {
+  let continueCalled = false;
+  let cancelCalled = false;
+  const localAgentClient = makeLocalAgentMcpClient({
+    continue: async () => {
+      continueCalled = true;
+      return Result.ok(makeAgentRecord());
+    },
+    cancel: async () => {
+      cancelCalled = true;
+      return Result.ok(makeAgentRecord());
+    },
+  });
+  const context = await fixture(t, {
+    localAgentProviders: [{ name: "codex", available: true }],
+    localAgentClient,
+  });
+
+  const continueResponse = await callAgentContinue(context.client, {
+    workspaceId: "ws_missing",
+    agentId: "agt_missing_workspace",
+    prompt: "try this",
+  });
+  assert.equal(continueResponse.isError, true);
+  assert.match(responseText(continueResponse), /Unknown workspaceId: ws_missing/);
+
+  const cancelResponse = await callAgentCancel(context.client, {
+    workspaceId: "ws_missing",
+    agentId: "agt_missing_workspace",
+  });
+  assert.equal(cancelResponse.isError, true);
+  assert.match(responseText(cancelResponse), /Unknown workspaceId: ws_missing/);
+  assert.equal(continueCalled, false);
+  assert.equal(cancelCalled, false);
+});
+
 test("agent_wait preserves terminal error record fields", async (t) => {
   const record = makeAgentRecord({
     id: "agt_wait_error",
@@ -192,10 +469,10 @@ test("agent_wait preserves terminal error record fields", async (t) => {
     errorCode: "PROVIDER_INFRASTRUCTURE_ERROR",
     errorRetryable: false,
   });
-  const localAgentClient: LocalAgentMcpClient = {
+  const localAgentClient = makeLocalAgentMcpClient({
     start: async () => Result.ok(record),
     wait: async () => Result.ok({ record, timedOut: false }),
-  };
+  });
   const context = await fixture(t, {
     localAgentProviders: [{ name: "codex", available: true }],
     localAgentClient,
@@ -220,10 +497,10 @@ test("agent_start exposes LocalAgentClient errors without replacing their code o
     retryable: false,
     message: "Unknown subagent profile or provider: missing-target.",
   });
-  const localAgentClient: LocalAgentMcpClient = {
+  const localAgentClient = makeLocalAgentMcpClient({
     start: async () => Result.err(error),
     wait: async () => Result.err(error),
-  };
+  });
   const context = await fixture(t, {
     localAgentProviders: [{ name: "codex", available: true }],
     localAgentClient,
@@ -245,10 +522,10 @@ test("agent_start exposes LocalAgentClient errors without replacing their code o
 
 test("agent_wait rejects timeout values outside the MCP bounds", async (t) => {
   const record = makeAgentRecord({ id: "agt_timeout_validation" });
-  const localAgentClient: LocalAgentMcpClient = {
+  const localAgentClient = makeLocalAgentMcpClient({
     start: async () => Result.ok(record),
     wait: async () => Result.ok({ record, timedOut: false }),
-  };
+  });
   const context = await fixture(t, {
     localAgentProviders: [{ name: "codex", available: true }],
     localAgentClient,
@@ -270,7 +547,7 @@ test("agent_wait rejects timeout values outside the MCP bounds", async (t) => {
 test("agent_start and agent_wait propagate unknown workspace errors", async (t) => {
   const record = makeAgentRecord({ id: "agt_unknown_workspace" });
   let clientCalled = false;
-  const localAgentClient: LocalAgentMcpClient = {
+  const localAgentClient = makeLocalAgentMcpClient({
     start: async () => {
       clientCalled = true;
       return Result.ok(record);
@@ -279,7 +556,7 @@ test("agent_start and agent_wait propagate unknown workspace errors", async (t) 
       clientCalled = true;
       return Result.ok({ record, timedOut: false });
     },
-  };
+  });
   const context = await fixture(t, {
     localAgentProviders: [{ name: "codex", available: true }],
     localAgentClient,
@@ -670,6 +947,39 @@ async function callAgentWait(
     name: "agent_wait",
     arguments: input,
   } as Parameters<Client["callTool"]>[0]);
+}
+
+async function callAgentContinue(
+  client: Client,
+  input: Record<string, unknown>,
+): Promise<Awaited<ReturnType<Client["callTool"]>>> {
+  return client.callTool({
+    name: "agent_continue",
+    arguments: input,
+  } as Parameters<Client["callTool"]>[0]);
+}
+
+async function callAgentCancel(
+  client: Client,
+  input: Record<string, unknown>,
+): Promise<Awaited<ReturnType<Client["callTool"]>>> {
+  return client.callTool({
+    name: "agent_cancel",
+    arguments: input,
+  } as Parameters<Client["callTool"]>[0]);
+}
+
+function makeLocalAgentMcpClient(
+  overrides: Partial<LocalAgentMcpClient> = {},
+): LocalAgentMcpClient {
+  const record = makeAgentRecord();
+  return {
+    start: async () => Result.ok(record),
+    wait: async () => Result.ok({ record, timedOut: false }),
+    continue: async () => Result.ok(record),
+    cancel: async () => Result.ok(record),
+    ...overrides,
+  };
 }
 
 function makeAgentRecord(overrides: Partial<LocalAgentRecord> = {}): LocalAgentRecord {
