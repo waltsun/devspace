@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { spawn, type ChildProcessWithoutNullStreams, type SpawnOptions } from "node:child_process";
 import { PassThrough } from "node:stream";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -371,4 +371,209 @@ assert.equal(unavailable.isErr(), true);
 if (unavailable.isErr()) {
   assert.equal(unavailable.error.code, "PROVIDER_UNAVAILABLE");
   assert.equal(unavailable.error.retryable, false);
+}
+
+{
+  const root = await mkdtemp(join(tmpdir(), "devspace-codex-cancellation-test-"));
+  const serverScript = join(root, "fake-codex.mjs");
+  const logPath = join(root, "messages.log");
+  const releasePath = join(root, "release");
+  await writeFile(serverScript, String.raw`
+import readline from "node:readline";
+import { appendFileSync, existsSync } from "node:fs";
+
+const logPath = process.env.DEVSPACE_FAKE_LOG;
+const releasePath = process.env.DEVSPACE_FAKE_RELEASE;
+let turn = 0;
+let currentPrompt = "";
+let currentThreadId = "";
+let currentTurnId = "";
+
+function log(value) {
+  appendFileSync(logPath, value + "\n");
+}
+
+function output(value) {
+  process.stdout.write(JSON.stringify(value) + "\n");
+}
+
+function waitForRelease(callback) {
+  if (existsSync(releasePath)) callback();
+  else setImmediate(() => waitForRelease(callback));
+}
+
+function complete(status, includeItem) {
+  const items = includeItem ? [{ type: "agentMessage", text: "fake response " + turn }] : [];
+  if (includeItem) {
+    output({ method: "item/completed", params: { threadId: currentThreadId, turnId: currentTurnId, item: items[0] } });
+  }
+  log("turn/completed:" + status);
+  output({ method: "turn/completed", params: {
+    threadId: currentThreadId,
+    turn: { id: currentTurnId, status, items },
+  } });
+}
+
+function sendTurnStartResponse(message) {
+  output({ id: message.id, result: { turn: { id: currentTurnId } } });
+  if (currentPrompt === "active-cancel" || currentPrompt === "abort-before-turn-response" || currentPrompt === "interrupt-error") return;
+  setImmediate(() => complete(currentPrompt === "external-interrupt" ? "interrupted" : "completed", true));
+}
+
+readline.createInterface({ input: process.stdin }).on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method) log(message.method);
+  if (message.method === "initialize") {
+    output({ id: message.id, result: { userAgent: "fake" } });
+    return;
+  }
+  if (message.method === "thread/start" || message.method === "thread/resume") {
+    output({ id: message.id, result: { thread: { id: message.params.threadId || "thread_new" } } });
+    return;
+  }
+  if (message.method === "turn/start") {
+    turn += 1;
+    currentPrompt = message.params.input[0].text;
+    currentThreadId = message.params.threadId;
+    currentTurnId = "turn_" + turn;
+    if (currentPrompt === "abort-before-turn-response") {
+      waitForRelease(() => sendTurnStartResponse(message));
+    } else {
+      sendTurnStartResponse(message);
+    }
+    return;
+  }
+  if (message.method === "turn/interrupt") {
+    if (currentPrompt === "interrupt-error") {
+      log("interrupt-error-response");
+      output({ id: message.id, error: { code: -32000, message: "interrupt failed" } });
+      waitForRelease(() => complete("completed", true));
+      return;
+    }
+    output({ id: message.id, result: {} });
+    setImmediate(() => complete("interrupted", false));
+  }
+});
+`, { encoding: "utf8" });
+
+  let command = serverScript;
+  if (process.platform === "win32") {
+    command = join(root, "fake-codex.cmd");
+    await writeFile(command, `@echo off\r\n"${process.execPath}" "${serverScript}" %*\r\n`, { encoding: "utf8" });
+  } else {
+    await chmod(serverScript, 0o700);
+  }
+
+  const runtime = new CodexAppServerRuntime({
+    command,
+    env: { ...process.env, DEVSPACE_FAKE_LOG: logPath, DEVSPACE_FAKE_RELEASE: releasePath },
+  });
+  const inputFor = (prompt: string, providerSessionId?: string) => ({
+    prompt,
+    workspaceRoot: "/tmp/project",
+    ...(providerSessionId ? { providerSessionId } : {}),
+  });
+  const methods = async (): Promise<string[]> => (await readFile(logPath, "utf8")).trim().split(/\r?\n/).filter(Boolean);
+  const count = async (method: string): Promise<number> => (await methods()).filter((value) => value === method).length;
+  const waitForLog = async (value: string): Promise<void> => {
+    await waitForAsync(async () => (await methods()).includes(value));
+  };
+  const assertCancelled = (result: Awaited<ReturnType<CodexAppServerRuntime["run"]>>) => {
+    assert.equal(result.isErr(), true);
+    if (result.isErr()) {
+      assert.equal(result.error.code, "PROVIDER_CANCELLED");
+      assert.equal(result.error.retryable, false);
+    }
+  };
+
+  try {
+    await runtime.initialize();
+
+    const preAborted = new AbortController();
+    preAborted.abort();
+    const preAbortedResult = await runtime.run(inputFor("pre-aborted"), undefined, { signal: preAborted.signal });
+    assertCancelled(preAbortedResult);
+    assert.equal(await count("thread/start"), 0, "pre-aborted run must not start a thread");
+    assert.equal(await count("thread/resume"), 0, "pre-aborted run must not resume a thread");
+    assert.equal(await count("turn/start"), 0, "pre-aborted run must not start a turn");
+    assert.equal(await count("turn/interrupt"), 0, "pre-aborted run must not interrupt a turn");
+
+    const beforeTurnController = new AbortController();
+    const beforeTurnResult = await runtime.run(
+      inputFor("before-turn"),
+      { onSessionId: () => { beforeTurnController.abort(); } },
+      { signal: beforeTurnController.signal },
+    );
+    assertCancelled(beforeTurnResult);
+    assert.equal(await count("thread/start"), 1, "thread identity must be created before the cancellation");
+    assert.equal(await count("turn/start"), 0, "cancellation after session callback must prevent turn/start");
+
+    const activeController = new AbortController();
+    const activeRun = runtime.run(inputFor("active-cancel"), undefined, { signal: activeController.signal });
+    await waitForLog("turn/start");
+    activeController.abort();
+    activeController.abort();
+    const activeResult = await activeRun;
+    assertCancelled(activeResult);
+    await waitForLog("turn/completed:interrupted");
+    assert.equal(await count("turn/interrupt"), 1, "one active turn must receive at most one interrupt");
+    assert.equal(await count("thread/unsubscribe"), 0, "cancellation must not release the thread");
+    assert.equal(runtime.isAlive(), true, "cancellation must not close the app-server runtime");
+
+    const reusedResult = await runtime.run(inputFor("reuse-after-cancel"), undefined, { signal: new AbortController().signal });
+    assert.equal(reusedResult.isOk(), true, "the same runtime must handle a later turn after cancellation");
+    if (reusedResult.isOk()) assert.equal(reusedResult.value.finalResponse, "fake response 2");
+    assert.equal(runtime.isAlive(), true);
+
+    const delayedController = new AbortController();
+    const turnStartCount = await count("turn/start");
+    const delayedRun = runtime.run(inputFor("abort-before-turn-response"), undefined, { signal: delayedController.signal });
+    await waitForAsync(async () => (await count("turn/start")) > turnStartCount);
+    delayedController.abort();
+    assert.equal(await count("turn/interrupt"), 1, "turnId-unknown cancellation must not interrupt early");
+    await writeFile(releasePath, "release", { encoding: "utf8" });
+    const delayedResult = await delayedRun;
+    assertCancelled(delayedResult);
+    await waitForAsync(async () => (await count("turn/interrupt")) === 2);
+
+    const externalInterrupted = await runtime.run(inputFor("external-interrupt"));
+    assertCancelled(externalInterrupted);
+
+    const lateController = new AbortController();
+    const completedResult = await runtime.run(inputFor("completion-wins"), undefined, { signal: lateController.signal });
+    assert.equal(completedResult.isOk(), true, "normal completion wins over a late abort");
+    const interruptsAfterCompletion = await count("turn/interrupt");
+    lateController.abort();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(await count("turn/interrupt"), interruptsAfterCompletion, "completed turns must not be interrupted");
+
+    await rm(releasePath, { force: true });
+    const errorController = new AbortController();
+    let errorRunSettled = false;
+    const errorTurnStartCount = await count("turn/start");
+    const errorRun = runtime.run(inputFor("interrupt-error"), undefined, { signal: errorController.signal }).then((result) => {
+      errorRunSettled = true;
+      return result;
+    });
+    await waitForAsync(async () => (await count("turn/start")) > errorTurnStartCount);
+    errorController.abort();
+    await waitForLog("interrupt-error-response");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(errorRunSettled, false, "interrupt RPC failure must not finish the run");
+    await writeFile(releasePath, "release", { encoding: "utf8" });
+    const errorResult = await errorRun;
+    assert.equal(errorResult.isOk(), true, "authoritative normal completion still wins after interrupt error");
+    assert.equal(await count("thread/unsubscribe"), 0);
+  } finally {
+    await runtime.close();
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+async function waitForAsync(check: () => Promise<boolean>): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (!(await check()) && Date.now() < deadline) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  assert.equal(await check(), true, "condition did not become true before timeout");
 }

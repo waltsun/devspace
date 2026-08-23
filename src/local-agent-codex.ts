@@ -14,6 +14,7 @@ import { terminateProcessTree } from "./process-platform.js";
 import type {
   LocalAgentDriver,
   LocalAgentRunCallbacks,
+  LocalAgentRunControl,
   LocalAgentRunInput,
   LocalAgentRunResult,
   LocalAgentRuntime,
@@ -297,11 +298,16 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
     this.rpc.notify("initialized");
   }
 
-  async run(input: LocalAgentRunInput, callbacks?: LocalAgentRunCallbacks) {
+  async run(
+    input: LocalAgentRunInput,
+    callbacks?: LocalAgentRunCallbacks,
+    control?: LocalAgentRunControl,
+  ) {
     return captureAgentProviderResult({
       provider: this.provider,
       operation: "run",
       run: async (): Promise<LocalAgentRunResult> => {
+        if (control?.signal?.aborted) throw codexAbortError();
         if (!this.isAlive()) {
           throw new AgentProviderUnavailableError({
             code: "PROVIDER_UNAVAILABLE",
@@ -328,8 +334,12 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
         }
 
         await callbacks?.onSessionId?.(threadId);
-        const completed = await this.rpc.runTurn(threadId, turnParams(input, threadId));
+        if (control?.signal?.aborted) throw codexAbortError();
+        const completed = await this.rpc.runTurn(threadId, turnParams(input, threadId), control?.signal);
         const parsed = parseCompletedTurn(completed.event.params, completed.items);
+        if (parsed.status === "interrupted") {
+          throw codexAbortError();
+        }
         if (parsed.failure) {
           throw new AgentProviderExecutionError({
             code: "PROVIDER_EXECUTION_ERROR",
@@ -521,6 +531,8 @@ interface CodexTurnAccumulator {
   turnId?: string;
   items: unknown[];
   completed?: CodexEvent;
+  abortRequested: boolean;
+  interruptStarted: boolean;
   resolve: (result: CodexTurnResult) => void;
   reject: (error: Error) => void;
 }
@@ -560,8 +572,9 @@ class CodexAppServerRpc {
     this.write({ method, ...(params === undefined ? {} : { params }) });
   }
 
-  async runTurn(threadId: string, params: unknown): Promise<CodexTurnResult> {
+  async runTurn(threadId: string, params: unknown, signal?: AbortSignal): Promise<CodexTurnResult> {
     if (this.fatalError) throw this.fatalError;
+    if (signal?.aborted) throw codexAbortError();
     if (this.turns.has(threadId)) throw new Error(`Codex thread ${threadId} already has an active turn.`);
     let resolveTurn!: (result: CodexTurnResult) => void;
     let rejectTurn!: (error: Error) => void;
@@ -572,18 +585,39 @@ class CodexAppServerRpc {
     const turn: CodexTurnAccumulator = {
       threadId,
       items: [],
+      abortRequested: false,
+      interruptStarted: false,
       resolve: resolveTurn,
       reject: rejectTurn,
     };
     this.turns.set(threadId, turn);
+    const onAbort = () => {
+      turn.abortRequested = true;
+      this.maybeInterruptTurn(turn);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
     try {
       const response = await this.request("turn/start", params);
       turn.turnId = readString(asRecord(response)?.turn, "id");
+      this.maybeInterruptTurn(turn);
       if (turn.completed) return { event: turn.completed, items: turn.items };
       return await completion;
     } finally {
+      signal?.removeEventListener("abort", onAbort);
       if (this.turns.get(threadId) === turn) this.turns.delete(threadId);
     }
+  }
+
+  private maybeInterruptTurn(turn: CodexTurnAccumulator): void {
+    if (!turn.abortRequested || !turn.turnId || turn.completed || turn.interruptStarted) return;
+    turn.interruptStarted = true;
+    void this.request("turn/interrupt", {
+      threadId: turn.threadId,
+      turnId: turn.turnId,
+    }).catch(() => {
+      // The authoritative outcome is still turn/completed; do not end the run here.
+    });
   }
 
   fail(error: Error): void {
@@ -692,6 +726,7 @@ function sandboxPolicyFor(writeMode: LocalAgentWriteMode | undefined): Record<st
 }
 
 function parseCompletedTurn(params: unknown, items: unknown[]): {
+  status?: string;
   finalResponse: string;
   items: unknown[];
   failure?: string;
@@ -707,12 +742,18 @@ function parseCompletedTurn(params: unknown, items: unknown[]): {
       finalResponse = record.text;
     }
   }
-  const status = turn?.status;
+  const status = typeof turn?.status === "string" ? turn.status : undefined;
   const error = asRecord(turn?.error);
   const failure = status === "failed"
     ? directString(error?.message) ?? "Codex turn failed."
     : undefined;
-  return { finalResponse, items: completedItems, failure };
+  return { status, finalResponse, items: completedItems, failure };
+}
+
+function codexAbortError(): Error {
+  const error = new Error("Codex agent turn was cancelled.");
+  error.name = "AbortError";
+  return error;
 }
 
 export function codexAppServerError(message: string, version?: string, stderr?: string): Error {

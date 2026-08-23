@@ -31,6 +31,10 @@ export interface LocalAgentRunCallbacks {
   onSessionId?: (providerSessionId: string) => void | Promise<void>;
 }
 
+export interface LocalAgentRunControl {
+  signal?: AbortSignal;
+}
+
 export interface LocalAgentRuntimeContext {
   agentId: string;
   provider: LocalAgentProvider;
@@ -52,6 +56,7 @@ export interface LocalAgentRuntime {
   run(
     input: LocalAgentRunInput,
     callbacks?: LocalAgentRunCallbacks,
+    control?: LocalAgentRunControl,
   ): Promise<Result<LocalAgentRunResult, AgentProviderError>>;
   releaseSession(providerSessionId: string): Promise<void>;
   close(): Promise<void>;
